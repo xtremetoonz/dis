@@ -1,2 +1,0 @@
-# dis
-Domain Intel Scanner

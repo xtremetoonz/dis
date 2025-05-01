@@ -87,7 +87,7 @@ DIS is a DNS monitoring and domain intelligence tool that:
 
 ### 3.10 DKIM Record
 - Test against known selectors:
-  - spop1024, dk, mandrill, mailchimp (k2, k3, mte1, mte2), mailgun, mailjet, mailkit, mailpoet, mailup, mapp1, pm, 20210112, emsd1, k1, selector1, selector2, s1, s2, default, sendgrid, amazonses, mail, mailsec, scph0418, _domainkey
+  - spop1024, dk, mandrill, mailchimp (k2, k3, mte1, mte2), mailgun, mailjet, mailkit, mailpoet, mailup, mapp1, pm, 20210112, emsd1, k1, selector1, selector2, s1, s2, default, sendgrid, amazonses, ...
 - Group by provider
 - Show TXT result or note selector tested
 - CNAME → TXT failure is a ⚠️
