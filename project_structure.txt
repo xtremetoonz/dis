@@ -1,0 +1,25 @@
+/srv/git/dis/
+├── backend/
+│   ├── __init__.py
+│   ├── api.py         # Our main API file - this is where our endpoints live
+│   ├── config.py      # Configuration and environment variables
+│   ├── models.py      # Database models
+│   └── scanner/       # Our scanner module
+│       ├── __init__.py
+│       ├── dns_checks.py
+│       ├── email_security.py
+│       ├── tls_checks.py
+│       └── cert_checks.py
+├── frontend/
+├── tests/            # Test directory at root level
+│   ├── __init__.py
+│   └── backend/
+│       ├── __init__.py
+│       ├── test_api.py
+│       └── test_scanner/
+│           ├── __init__.py
+│           ├── test_dns_checks.py
+│           ├── test_email_security.py
+│           ├── test_tls_checks.py
+│           └── test_cert_checks.py
+└── requirements.txt
