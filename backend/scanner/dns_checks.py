@@ -1,37 +1,69 @@
-import subprocess
+import dns.resolver
+import dns.query
+import dns.zone
+from dns.exception import DNSException
+from typing import Dict
 
-def run_dig(domain, record_type="ANY"):
+def get_all_dns_records(domain: str) -> Dict:
     """
-    Runs the 'dig' command for the given domain and record type.
+    Retrieves all relevant DNS records for a domain.
     """
+    results = {
+        "a_records": [],
+        "aaaa_records": [],
+        "txt_records": [],
+        "mx_records": [],
+        "ns_records": [],
+        "errors": []
+    }
+
+    record_types = ['A', 'AAAA', 'TXT', 'MX', 'NS']
+    resolver = dns.resolver.Resolver()
+
+    for record_type in record_types:
+        try:
+            answers = resolver.resolve(domain, record_type)
+            for rdata in answers:
+                if record_type == 'A':
+                    results["a_records"].append(str(rdata))
+                elif record_type == 'AAAA':
+                    results["aaaa_records"].append(str(rdata))
+                elif record_type == 'TXT':
+                    results["txt_records"].append("".join(s.decode() for s in rdata.strings))
+                elif record_type == 'MX':
+                    results["mx_records"].append({
+                        "preference": rdata.preference,
+                        "exchange": str(rdata.exchange)
+                    })
+                elif record_type == 'NS':
+                    results["ns_records"].append(str(rdata))
+        except dns.resolver.NoAnswer:
+            continue
+        except Exception as e:
+            results["errors"].append(f"Error getting {record_type} records: {str(e)}")
+
+    return results
+
+def check_dnssec(domain: str) -> Dict:
+    """
+    Checks DNSSEC configuration for the domain.
+    """
+    result = {
+        "enabled": False,
+        "valid": False,
+        "errors": []
+    }
+
     try:
-        result = subprocess.check_output(
-            ["dig", domain, record_type], text=True
-        )
-        return {"status": "success", "data": result}
-    except subprocess.CalledProcessError as e:
-        return {"status": "error", "message": str(e)}
+        dnskey = dns.resolver.resolve(domain, 'DNSKEY')
+        ds = dns.resolver.resolve(domain, 'DS')
+        
+        result["enabled"] = True
+        result["valid"] = bool(dnskey and ds)
+        
+    except dns.resolver.NoAnswer:
+        result["errors"].append("No DNSSEC records found")
+    except Exception as e:
+        result["errors"].append(f"Error checking DNSSEC: {str(e)}")
 
-def check_mx_records(domain):
-    """
-    Checks for MX records for the given domain.
-    """
-    dig_result = run_dig(domain, "MX")
-    if dig_result["status"] == "success":
-        if "ANSWER SECTION" in dig_result["data"]:
-            return {"status": "success", "message": "MX records found"}
-        else:
-            return {"status": "warning", "message": "No MX records found"}
-    return dig_result
-
-def check_dnssec(domain):
-    """
-    Checks if the domain has DNSSEC enabled.
-    """
-    dig_result = run_dig(domain, "DNSKEY")
-    if dig_result["status"] == "success":
-        if "ANSWER SECTION" in dig_result["data"]:
-            return {"status": "success", "message": "DNSSEC is enabled"}
-        else:
-            return {"status": "warning", "message": "DNSSEC not found"}
-    return dig_result
+    return result

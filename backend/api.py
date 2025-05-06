@@ -1,27 +1,14 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
+from datetime import datetime
 import uuid
-from scanner.whois_checks import run_whois, parse_whois
-from scanner.dns_checks import check_mx_records, check_dnssec
-import mysql.connector
+from backend.scanner.dns_checks import get_all_dns_records, check_dnssec
+from backend.scanner.email_security import EmailSecurityChecker
+from backend.scanner.tls_checks import TLSSecurityChecker
+from backend.scanner.cert_checks import CertificateChecker
 
 app = Flask(__name__)
-
-# Database connection
-def get_db_connection():
-    return mysql.connector.connect(
-        host="localhost",
-        user="dis_user",
-        password="tv6LhpUq_ytcU9@o2g93",
-        database="dis_database"
-    )
-
-# Helper: Execute Linux commands
-def run_command(command):
-    try:
-        result = subprocess.check_output(command, shell=True, text=True)
-        return result
-    except subprocess.CalledProcessError as e:
-        return e.output
+CORS(app)
 
 @app.route('/api/scan', methods=['POST'])
 def scan_domain():
@@ -31,41 +18,57 @@ def scan_domain():
         return jsonify({"error": "Domain is required"}), 400
 
     scan_id = str(uuid.uuid4())
-    results = {}
+    
+    results = {
+        "scan_metadata": {
+            "scan_id": scan_id,
+            "domain": domain,
+            "timestamp": "2025-05-02 21:50:09"
+        }
+    }
 
-    # Perform WHOIS checks
-    whois_raw = run_whois(domain)
-    if whois_raw["status"] == "success":
-        results["whois"] = parse_whois(whois_raw["data"])
-    else:
-        results["whois"] = {"status": "error", "message": whois_raw["message"]}
+    try:
+        # Run DNS checks
+        results["dns_checks"] = {
+            "records": get_all_dns_records(domain),
+            "dnssec": check_dnssec(domain)
+        }
 
-    # Perform DNS checks
-    results["mx_records"] = check_mx_records(domain)
-    results["dnssec"] = check_dnssec(domain)
+        # Run Email Security checks
+        email_checker = EmailSecurityChecker(domain)
+        email_results = email_checker.run_all_checks()
+        results.update({
+            "spf_checks": email_results["spf_checks"],
+            "dkim_checks": email_results["dkim_checks"],
+            "dmarc_checks": email_results["dmarc_checks"]
+        })
 
-    # Save results to MySQL database
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO scans (id, domain, results) VALUES (%s, %s, %s)",
-                   (scan_id, domain, str(results)))
-    conn.commit()
-    conn.close()
+        # Run TLS checks
+        tls_checker = TLSSecurityChecker(domain)
+        tls_results = tls_checker.run_all_checks()
+        results.update({
+            "mta_sts_checks": tls_results["mta_sts_checks"],
+            "tls_rpt_checks": tls_results["tls_rpt_checks"],
+            "ssl_tls_checks": tls_results["ssl_tls_checks"]
+        })
 
-    return jsonify({"scan_id": scan_id, "results": results}), 200
+        # Run Certificate checks
+        cert_checker = CertificateChecker(domain)
+        cert_results = cert_checker.run_all_checks()
+        results.update({
+            "caa_records": cert_results["caa_records"],
+            "ct_logs": cert_results["ct_logs"],
+            "cert_chain": cert_results["cert_chain"],  # Changed from ca_validation to cert_chain
+            "certificate": cert_results["certificate"]  # Added certificate details
+        })
 
-@app.route('/api/results/<scan_id>', methods=['GET'])
-def get_results(scan_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT results FROM scans WHERE id = %s", (scan_id,))
-    row = cursor.fetchone()
-    conn.close()
+        return jsonify(results), 200
 
-    if row:
-        return jsonify({"scan_id": scan_id, "results": eval(row[0])})
-    else:
-        return jsonify({"error": "Scan ID not found"}), 404
+    except Exception as e:
+        return jsonify({
+            "error": "Scan failed",
+            "message": str(e)
+        }), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(debug=True)

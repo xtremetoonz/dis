@@ -1,0 +1,143 @@
+from datetime import datetime
+import uuid
+from typing import Dict, Optional
+from .dns_checks import run_dig, check_zone_transfer, get_all_dns_records, check_dnssec, get_nameserver_info
+from .email_security import EmailSecurityChecker
+from .tls_checks import TLSSecurityChecker
+from .cert_checks import CertificateChecker
+
+class DomainScanner:
+    def __init__(self, domain: str, cert_spotter_api_key: Optional[str] = None):
+        self.domain = domain
+        self.scan_id = str(uuid.uuid4())
+        self.cert_spotter_api_key = cert_spotter_api_key
+
+    def run_scan(self) -> Dict:
+        """
+        Orchestrates the complete domain security scan.
+        """
+        scan_results = {
+            "scan_metadata": {
+                "scan_id": self.scan_id,
+                "domain": self.domain,
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            }
+        }
+
+        try:
+            # Initialize checkers
+            email_checker = EmailSecurityChecker(self.domain)
+            tls_checker = TLSSecurityChecker(self.domain)
+            cert_checker = CertificateChecker(self.domain, self.cert_spotter_api_key)
+
+            # DNS Checks
+            dns_results = {
+                "nameserver_checks": get_nameserver_info(self.domain),
+                "zone_transfer": check_zone_transfer(self.domain),
+                "dnssec": check_dnssec(self.domain),
+                "records": get_all_dns_records(self.domain)
+            }
+            scan_results.update({"dns_checks": dns_results})
+
+            # Email Security Checks
+            email_security_results = email_checker.run_all_checks()
+            scan_results.update(email_security_results)
+
+            # TLS Security Checks
+            tls_security_results = tls_checker.run_all_checks()
+            scan_results.update(tls_security_results)
+
+            # Certificate Checks
+            cert_results = cert_checker.run_all_checks()
+            scan_results.update(cert_results)
+
+            # Generate Summary
+            summary = self._generate_summary(scan_results)
+            scan_results["summary"] = summary
+
+        except Exception as e:
+            scan_results["error"] = str(e)
+            scan_results["status"] = "failed"
+        else:
+            scan_results["status"] = "completed"
+
+        return scan_results
+
+    def _generate_summary(self, results: Dict) -> Dict:
+        """
+        Generates a summary of all security findings.
+        """
+        summary = {
+            "status": "completed",
+            "issues_found": [],
+            "recommendations": [],
+            "risk_assessment": {
+                "overall": "low",
+                "spf": "low",
+                "dkim": "low",
+                "dmarc": "low",
+                "dns": "low",
+                "ssl_tls": "low",
+                "mta_sts": "low"
+            }
+        }
+
+        # Analyze DNS Security
+        if not results.get("dns_checks", {}).get("dnssec", {}).get("enabled"):
+            summary["issues_found"].append("DNSSEC not enabled")
+            summary["recommendations"].append("Enable DNSSEC to prevent DNS spoofing")
+            summary["risk_assessment"]["dns"] = "medium"
+
+        if results.get("dns_checks", {}).get("zone_transfer", {}).get("enabled"):
+            summary["issues_found"].append("Zone transfer enabled")
+            summary["recommendations"].append("Disable zone transfers")
+            summary["risk_assessment"]["dns"] = "high"
+
+        # Analyze Email Security
+        spf_checks = results.get("spf_checks", {})
+        if not spf_checks.get("valid"):
+            summary["issues_found"].append("Invalid or missing SPF record")
+            summary["recommendations"].extend(spf_checks.get("recommendations", []))
+            summary["risk_assessment"]["spf"] = "high"
+
+        dkim_checks = results.get("dkim_checks", {})
+        if not dkim_checks.get("found"):
+            summary["issues_found"].append("DKIM not configured")
+            summary["recommendations"].extend(dkim_checks.get("recommendations", []))
+            summary["risk_assessment"]["dkim"] = "high"
+
+        dmarc_checks = results.get("dmarc_checks", {})
+        if not dmarc_checks.get("valid"):
+            summary["issues_found"].append("Invalid or missing DMARC record")
+            summary["recommendations"].extend(dmarc_checks.get("recommendations", []))
+            summary["risk_assessment"]["dmarc"] = "high"
+
+        # Analyze TLS Security
+        mta_sts_checks = results.get("mta_sts_checks", {})
+        if not mta_sts_checks.get("policy_found"):
+            summary["issues_found"].append("MTA-STS not configured")
+            summary["recommendations"].extend(mta_sts_checks.get("recommendations", []))
+            summary["risk_assessment"]["mta_sts"] = "medium"
+
+        ssl_checks = results.get("ssl_tls_checks", {})
+        if ssl_checks.get("vulnerabilities"):
+            summary["issues_found"].extend(ssl_checks.get("vulnerabilities", []))
+            summary["recommendations"].extend(ssl_checks.get("recommendations", []))
+            summary["risk_assessment"]["ssl_tls"] = "high"
+
+        # Calculate Overall Risk
+        risk_levels = {"low": 1, "medium": 2, "high": 3}
+        risk_values = [risk_levels[level] for level in summary["risk_assessment"].values()]
+        avg_risk = sum(risk_values) / len(risk_values)
+        summary["risk_assessment"]["overall"] = (
+            "high" if avg_risk >= 2.5 else "medium" if avg_risk >= 1.5 else "low"
+        )
+
+        return summary
+
+def scan_domain(domain: str, cert_spotter_api_key: Optional[str] = None) -> Dict:
+    """
+    Main entry point for domain scanning.
+    """
+    scanner = DomainScanner(domain, cert_spotter_api_key)
+    return scanner.run_scan()

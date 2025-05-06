@@ -1,10 +1,11 @@
-CREATE DATABASE dis_database;
-
-USE dis_database;
-
-CREATE TABLE scans (
-    id VARCHAR(36) PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS scans (
+    id INT AUTO_INCREMENT PRIMARY KEY,
     domain VARCHAR(255) NOT NULL,
+    scan_date DATETIME NOT NULL,
+    user VARCHAR(255) NOT NULL,
     results TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    warnings TEXT,
+    INDEX (domain),
+    INDEX (user),
+    INDEX (scan_date)
 );

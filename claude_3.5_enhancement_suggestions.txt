@@ -1,0 +1,10 @@
+Add async support for faster scanning
+Implement rate limiting for API calls
+Add caching for DNS queries
+Create a web interface
+Add support for bulk domain scanning
+Implement reporting templates
+Add support for custom DNS resolvers
+Implement scan result persistence
+Add scan comparison functionality
+Create an API endpoint for the scanner
