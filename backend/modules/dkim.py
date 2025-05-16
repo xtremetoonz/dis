@@ -249,11 +249,11 @@ def check_dkim_selector(domain: str, selector: str, follow_cname: bool = True) -
 def check_dkim_selectors(domain: str, selectors: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Checks DKIM selectors for a domain and validates both Microsoft and Google selectors.
-    
+
     Args:
         domain (str): Domain to check
         selectors (List[str], optional): List of selectors to check. If None, checks defaults.
-        
+
     Returns:
         Dict: Dictionary containing DKIM check results
     """
@@ -267,85 +267,95 @@ def check_dkim_selectors(domain: str, selectors: Optional[List[str]] = None) -> 
         "warnings": [],
         "recommendations": []
     }
-    
+
     try:
         # Try to determine email provider from MX records
         mx_provider = get_mx_provider(domain)
         results["mx_provider_detected"] = mx_provider
-        
+
         # Keep track of which selectors were explicitly requested
         explicit_selectors = set(selectors) if selectors else set()
-        
+
         # Determine which selectors to check
         if selectors:
             # User specified selectors - check only those
             selectors_to_check = selectors
+            # Don't add provider-specific warnings when explicit selectors are requested
+            check_provider_specific = False
         else:
             # Always check both Microsoft and Google selectors, plus common ones
             selectors_to_check = PROVIDER_GROUPS["Microsoft"] + PROVIDER_GROUPS["Google"] + [
                 "default", "dkim", "k1", "mail", "sendgrid", "amazonses"
             ]
-        
+            # Do add provider-specific warnings when no selectors are specified
+            check_provider_specific = True
+
         results["selectors_checked_count"] = len(selectors_to_check)
-        
+
         # Track selectors actually found
         found_selectors = []
         valid_selectors = []
-        
+
         # Store provider-specific status
         microsoft_found = []
         microsoft_valid = []
         google_found = []
         google_valid = []
-        
+
         # Check each selector
         for selector in selectors_to_check:
             try:
                 selector_result = check_dkim_selector(domain, selector)
-                
+
                 # If found, track it
                 if selector_result["found"]:
                     found_selectors.append(selector)
-                    
+
                     # Check if it has a valid key
                     if selector_result["has_valid_key"]:
                         valid_selectors.append(selector)
-                        
+
                         # Add to records dictionary (always include valid selectors)
                         results["records"][selector] = selector_result
-                        
+
                     else:
                         # Found but invalid - issue a warning
                         results["warnings"].append(f"Selector {selector} found but does not contain a valid DKIM key")
-                        
+
+                        # Add Microsoft-specific recommendation for key rotation
+                        if selector in PROVIDER_GROUPS["Microsoft"]:
+                            microsoft_key_message = "Go to your Microsoft DKIM admin center and rotate your keys"
+                            results["recommendations"].append(microsoft_key_message)
+                            results["warnings"].append(microsoft_key_message)  # Also add to warnings
+
                         # Include in output if it's Microsoft, Google, or explicitly requested
-                        if (selector in PROVIDER_GROUPS["Microsoft"] or 
-                            selector in PROVIDER_GROUPS["Google"] or 
+                        if (selector in PROVIDER_GROUPS["Microsoft"] or
+                            selector in PROVIDER_GROUPS["Google"] or
                             selector in explicit_selectors):
                             results["records"][selector] = selector_result
-                    
+
                     # Track Microsoft selectors
                     if selector in PROVIDER_GROUPS["Microsoft"]:
                         microsoft_found.append(selector)
                         if selector_result["has_valid_key"]:
                             microsoft_valid.append(selector)
-                            
+
                     # Track Google selectors
                     if selector in PROVIDER_GROUPS["Google"]:
                         google_found.append(selector)
                         if selector_result["has_valid_key"]:
                             google_valid.append(selector)
-                
+
             except Exception as e:
                 logger.error(f"Error checking selector {selector}: {str(e)}")
                 # Don't include errors for selectors that failed in the output
-        
+
         # Update selectors_found with actually found selectors
         results["selectors_found"] = found_selectors
-        
+
         # Add provider-specific information only if relevant
         results["provider_status"] = {}
-        
+
         # Only include Microsoft status if Microsoft selectors were found or MX is Microsoft
         if microsoft_found or mx_provider == "Microsoft":
             results["provider_status"]["Microsoft"] = {
@@ -353,7 +363,7 @@ def check_dkim_selectors(domain: str, selectors: Optional[List[str]] = None) -> 
                 "selectors_valid": microsoft_valid,
                 "configured": len(microsoft_valid) > 0
             }
-            
+
         # Only include Google status if Google selectors were found or MX is Google
         if google_found or mx_provider == "Google":
             results["provider_status"]["Google"] = {
@@ -361,44 +371,51 @@ def check_dkim_selectors(domain: str, selectors: Optional[List[str]] = None) -> 
                 "selectors_valid": google_valid,
                 "configured": len(google_valid) > 0
             }
-        
+
         # Provider-specific recommendations
-        # If MX is Microsoft but Microsoft DKIM is not configured
-        if mx_provider == "Microsoft" and (not microsoft_valid):
-            if not microsoft_found:
-                results["errors"].append("Microsoft MX detected but no Microsoft DKIM selectors found")
-                results["recommendations"].append("Add Microsoft DKIM selectors: selector1 and selector2")
-            else:
-                results["errors"].append("Microsoft MX detected but Microsoft DKIM selectors don't have valid keys")
-                results["recommendations"].append("Configure valid DKIM keys for Microsoft selectors")
-                
-        # If MX is Google but Google DKIM is not configured
-        elif mx_provider == "Google" and (not google_valid):
-            if not google_found:
-                results["errors"].append("Google MX detected but no Google DKIM selectors found")
-                results["recommendations"].append("Add at least one Google DKIM selector (google, s1, or s2)")
-            else:
-                results["errors"].append("Google MX detected but Google DKIM selectors don't have valid keys")
-                results["recommendations"].append("Configure valid DKIM keys for Google selectors")
-        
-        # If no DKIM is configured at all
-        if not found_selectors:
+        # Only make provider-specific recommendations if not checking explicit selectors
+        # or if the explicit selectors include provider selectors
+        if check_provider_specific or any(s in explicit_selectors for s in PROVIDER_GROUPS["Microsoft"]):
+            # If MX is Microsoft but Microsoft DKIM is not configured
+            if mx_provider == "Microsoft" and (not microsoft_valid):
+                if not microsoft_found:
+                    results["errors"].append("Microsoft MX detected but no Microsoft DKIM selectors found")
+                    results["recommendations"].append("Add Microsoft DKIM selectors: selector1 and selector2")
+                else:
+                    results["errors"].append("Microsoft MX detected but Microsoft DKIM selectors don't have valid keys")
+                    results["recommendations"].append("Configure valid DKIM keys for Microsoft selectors")
+                    # Note: The specific recommendation for key rotation is now added when the selector is checked
+
+        # Only make Google-specific recommendations if we're not checking explicit selectors
+        # or if the explicit selectors include Google selectors
+        if check_provider_specific or any(s in explicit_selectors for s in PROVIDER_GROUPS["Google"]):
+            # If MX is Google but Google DKIM is not configured
+            if mx_provider == "Google" and (not google_valid):
+                if not google_found:
+                    results["errors"].append("Google MX detected but no Google DKIM selectors found")
+                    results["recommendations"].append("Add at least one Google DKIM selector (google, s1, or s2)")
+                else:
+                    results["errors"].append("Google MX detected but Google DKIM selectors don't have valid keys")
+                    results["recommendations"].append("Configure valid DKIM keys for Google selectors")
+
+        # If no DKIM is configured at all and we're not doing an explicit selector check
+        if check_provider_specific and not found_selectors:
             results["errors"].append("No DKIM selectors found")
             results["recommendations"].append("Implement DKIM to improve email deliverability and security")
-        elif not valid_selectors:
+        elif check_provider_specific and not valid_selectors:
             results["errors"].append("DKIM selectors found but none have valid keys")
             results["recommendations"].append("Ensure DKIM selectors have valid keys")
-            
+
         # Add stats about found selectors
         results["stats"] = {
             "selectors_found_count": len(found_selectors),
             "selectors_with_valid_keys": len(valid_selectors),
             "status": "configured" if valid_selectors else "missing"
         }
-            
+
     except Exception as e:
         results["errors"].append(f"Error checking DKIM selectors: {str(e)}")
-    
+
     # Ensure the result is JSON serializable
     try:
         json.dumps(results)
@@ -414,5 +431,5 @@ def check_dkim_selectors(domain: str, selectors: Optional[List[str]] = None) -> 
             "warnings": results.get("warnings", []),
             "recommendations": results.get("recommendations", [])
         }
-    
+
     return results

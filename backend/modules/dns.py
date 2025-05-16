@@ -289,12 +289,17 @@ def check_open_resolver(domain: str) -> Dict[str, Any]:
     results = {
         "ns_checked": [],
         "open_resolvers": [],
-        "errors": []
+        "errors": [],
+        "warnings": []
     }
     
     try:
         # Get nameservers
-        ns_records = dns.resolver.resolve(domain, 'NS')
+        try:
+            ns_records = dns.resolver.resolve(domain, 'NS')
+        except Exception as e:
+            results["errors"].append(f"Could not resolve nameservers: {str(e)}")
+            return results
         
         for ns in ns_records:
             ns_name = str(ns).rstrip('.')
@@ -317,17 +322,56 @@ def check_open_resolver(domain: str) -> Dict[str, Any]:
                 }
                 
                 try:
-                    # Try to send query to the nameserver
-                    response = dns.query.udp(test_query, ip, timeout=5)
+                    # Try to send query to the nameserver with a short timeout
+                    response = dns.query.udp(test_query, ip, timeout=3)
                     
-                    # Check if we got a response with answers
-                    if response.answer:
+                    # More accurate check for open resolvers:
+                    # 1. Check for successful answer to the query
+                    has_answer = response and response.answer and len(response.answer) > 0
+                    
+                    # 2. Check for recursion available flag
+                    recursion_available = response and (response.flags & dns.flags.RA)
+                    
+                    # Properly configured authoritative nameservers should:
+                    # - Not answer recursive queries for unrelated domains
+                    # - Not have the RA flag set
+                    
+                    if has_answer:
+                        # Actually provided an answer to our query - definitely open
                         ns_result["is_open"] = True
                         results["open_resolvers"].append(ns_result)
+                        results["warnings"].append(f"Nameserver {ns_name} ({ip}) is an open resolver - answered query for unrelated domain")
+                    elif recursion_available:
+                        # RA flag is set - this is often a sign, but not definitive
+                        # Check if it actually provided usable information or just a referral
+                        if len(response.authority) > 0 and not response.answer:
+                            # This is likely just a proper referral response, not an open resolver
+                            ns_result["is_open"] = False
+                        else:
+                            # Set recursion available but didn't give a proper referral - likely open
+                            ns_result["is_open"] = True
+                            results["open_resolvers"].append(ns_result)
+                            results["warnings"].append(f"Nameserver {ns_name} ({ip}) may be an open resolver - has recursion available flag")
+                    else:
+                        # Responded but didn't answer query and no RA flag - good
+                        ns_result["is_open"] = False
+                        
                 except Exception as e:
+                    # This is actually good - the nameserver refused our query
                     ns_result["error"] = str(e)
-                    
+                    ns_result["is_open"] = False
+                
                 results["ns_checked"].append(ns_result)
+                
+        # Add clear warning and recommendation if open resolvers found
+        if results["open_resolvers"]:
+            results["warnings"].append(
+                "Open DNS resolvers can be abused for DNS amplification attacks"
+            )
+            results["recommendations"] = [
+                "Configure your nameservers to only provide recursive service to authorized clients",
+                "Check your DNS server configuration to disable recursive queries from external sources"
+            ]
                 
     except Exception as e:
         results["errors"].append(f"Error checking open resolvers: {str(e)}")
@@ -593,10 +637,13 @@ def get_all_dns_records(domain: str) -> Dict[str, Any]:
         "dmarc_record": None,
         "spf_record": None,
         "authoritative_nameserver": None,
-        "errors": []
+        "errors": [],
+        "warnings": [],
+        "recommendations": [],
+        "grade": None
     }
    
-        # First get the SOA record to find the authoritative nameserver
+    # First get the SOA record to find the authoritative nameserver
     try:
         auth_ns = get_authoritative_nameserver(domain)
         if auth_ns:
@@ -632,10 +679,6 @@ def get_all_dns_records(domain: str) -> Dict[str, Any]:
         'SOA': "soa_record",
         'CAA': "caa_records"
     }
-    
-#    resolver = dns.resolver.Resolver()
-#    resolver.timeout = 5.0
-#    resolver.lifetime = 10.0
     
     for rdtype, result_key in record_types.items():
         try:
@@ -715,13 +758,22 @@ def get_all_dns_records(domain: str) -> Dict[str, Any]:
     
     # Add enhanced security checks (wrapped in try-except to ensure JSON serialization)
     try:
-        results["security_checks"] = {
+        security_checks = {
             "dnssec": check_dnssec(domain),
             "nameserver_diversity": check_nameserver_diversity(domain),
             "zone_transfer": check_zone_transfer(domain),
             "open_resolver": check_open_resolver(domain),
             "wildcard_dns": check_wildcard_dns(domain)
         }
+        
+        # Add security check warnings and recommendations to main results
+        for check_name, check_result in security_checks.items():
+            if "warnings" in check_result:
+                results["warnings"].extend(check_result.get("warnings", []))
+            if "recommendations" in check_result:
+                results["recommendations"].extend(check_result.get("recommendations", []))
+        
+        results["security_checks"] = security_checks
         
         # Verify JSON serialization
         try:
@@ -760,6 +812,17 @@ def get_all_dns_records(domain: str) -> Dict[str, Any]:
             "message": str(e)
         }
     
+    # Grade DNS configuration
+    try:
+        results["grade"] = grade_dns_configuration(results)
+    except Exception as e:
+        logger.error(f"Error grading DNS configuration: {str(e)}")
+        results["grade"] = {
+            "grade": "F",
+            "score": 0,
+            "description": "Error grading DNS configuration"
+        }
+    
     # Final JSON serialization check
     try:
         json.dumps(results)
@@ -776,10 +839,122 @@ def get_all_dns_records(domain: str) -> Dict[str, Any]:
                 "ns_records": results.get("ns_records", []),
                 "txt_records": results.get("txt_records", []),
                 "errors": results.get("errors", []) + ["JSON serialization error"]
-            }
+            },
+            "grade": results.get("grade", {
+                "grade": "F", 
+                "score": 0, 
+                "description": "Error processing DNS records"
+            })
         }
     
     return results
+
+def grade_dns_configuration(dns_results: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Grade the DNS configuration based on security best practices.
+
+    Args:
+        dns_results (Dict): DNS check results
+
+    Returns:
+        Dict: Grade information
+    """
+    grade = {
+        "score": 0,
+        "grade": "C",
+        "description": "Average DNS configuration"
+    }
+
+    # Start with a baseline score
+    score = 5.0
+
+    # Check for basic DNS records
+    if not dns_results.get("ns_records"):
+        grade["grade"] = "F"
+        grade["description"] = "Missing NS records"
+        return grade
+
+    # Check for DNSSEC
+    dnssec = dns_results.get("security_checks", {}).get("dnssec", {})
+    if dnssec.get("enabled", False) and dnssec.get("validated", False):
+        score += 2.0  # Excellent
+    elif dnssec.get("enabled", False) and not dnssec.get("validated", False):
+        score += 0.5  # Partial implementation
+
+    # Check for weak DNSSEC algorithms
+    if dnssec.get("enabled", False) and dnssec.get("errors"):
+        for error in dnssec.get("errors", []):
+            if "weak" in error.lower() and "algorithm" in error.lower():
+                score -= 1.0  # Weak algorithm
+
+    # Check nameserver diversity
+    ns_diversity = dns_results.get("security_checks", {}).get("nameserver_diversity", {})
+    unique_ips = len(ns_diversity.get("unique_ips", []))
+    unique_prefixes = len(ns_diversity.get("unique_prefixes", []))
+
+    if unique_ips >= 4:
+        score += 1.5  # Excellent
+    elif unique_ips >= 3:
+        score += 1.0  # Good
+    elif unique_ips < 2:
+        score -= 1.0  # Poor
+
+    # Check for nameservers in the same subnet
+    same_subnet_count = ns_diversity.get("same_subnet_count", 0)
+    if same_subnet_count > 0:
+        score -= 1.0  # Not diverse
+
+    # Check for zone transfers
+    zone_transfer = dns_results.get("security_checks", {}).get("zone_transfer", {})
+    if zone_transfer.get("allowed", False):
+        score -= 3.0  # Critical issue
+
+    # Check for open resolvers
+    open_resolver = dns_results.get("security_checks", {}).get("open_resolver", {})
+    if open_resolver.get("open_resolvers", []):
+        score -= 2.5  # Serious issue
+
+    # Check for wildcard DNS
+    wildcard_dns = dns_results.get("security_checks", {}).get("wildcard_dns", {})
+    if wildcard_dns.get("has_wildcard", False):
+        score -= 0.5  # Potential issue
+
+    # Check for CAA records
+    has_caa = False
+    for record_type, records in dns_results.items():
+        if record_type == "caa_records" and records:
+            has_caa = True
+            score += 1.0  # Good security practice
+
+    # Calculate grade
+    grade["score"] = round(score, 1)
+
+    if score >= 8.0:
+        grade["grade"] = "A+"
+        grade["description"] = "Excellent DNS configuration"
+    elif score >= 7.0:
+        grade["grade"] = "A"
+        grade["description"] = "Very good DNS configuration"
+    elif score >= 6.0:
+        grade["grade"] = "B+"
+        grade["description"] = "Good DNS configuration"
+    elif score >= 5.0:
+        grade["grade"] = "B"
+        grade["description"] = "Above average DNS configuration"
+    elif score >= 4.0:
+        grade["grade"] = "C+"
+        grade["description"] = "Decent DNS configuration"
+    elif score >= 3.0:
+        grade["grade"] = "C"
+        grade["description"] = "Average DNS configuration"
+    elif score >= 2.0:
+        grade["grade"] = "D"
+        grade["description"] = "Below average DNS configuration"
+    else:
+        grade["grade"] = "F"
+        grade["description"] = "Poor DNS configuration"
+
+    return grade
 
 # Alias function to match import in routes.py
 get_dns_records = get_all_dns_records
