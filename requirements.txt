@@ -4,7 +4,7 @@ flask-cors==4.0.0
 python-dotenv==1.0.0
 dnspython==2.4.2
 requests==2.31.0
-cryptography==41.0.4
+cryptography
 
 # DNS/TLS related
 pyOpenSSL==23.3.0
