@@ -1,111 +1,418 @@
 import dns.resolver
-from dns.exception import DNSException
-from typing import Dict, List, Any
+import re
+from typing import Dict, List, Any, Optional, Set
 import logging
+import json
 
 # Configure module logger
 logger = logging.getLogger(__name__)
 
-def get_dns_records(domain: str) -> Dict[str, Any]:
+# Default selectors to check if none provided
+DEFAULT_SELECTORS = [
+    # Microsoft selectors - always check these
+    "selector1", "selector2",
+    # Google Workspace selectors - always check these
+    "google", "s1", "s2",
+    # Common email provider selectors
+    "default", "dkim", "k1", "mail",
+    # Common ESP selectors
+    "sendgrid", "amazonses"
+]
+
+# Provider groupings for selectors
+PROVIDER_GROUPS = {
+    "Microsoft": ["selector1", "selector2"],
+    "Google": ["google", "s1", "s2"],
+    "Amazon SES": ["amazonses"],
+    "Mailchimp/Mandrill": ["k1", "k2", "k3", "mte1", "mte2", "mandrill"],
+    "SendGrid": ["sendgrid", "smtpapi"],
+    "Generic": ["default", "dkim", "mail", "key1"]
+}
+
+def get_authoritative_nameserver(domain: str) -> Optional[str]:
     """
-    Retrieves all basic DNS records for a domain without any analysis.
+    Get the authoritative nameserver for a domain.
     
     Args:
         domain (str): The domain to query
         
     Returns:
-        Dict: Dictionary containing all retrieved DNS records
+        Optional[str]: Primary nameserver or None if not found
     """
-    results = {
-        "a_records": [],
-        "aaaa_records": [],
-        "ns_records": [],
-        "txt_records": [],
-        "soa_record": None,
-        "caa_records": [],
-        "errors": []
+    try:
+        soa_answers = dns.resolver.resolve(domain, 'SOA')
+        if soa_answers:
+            # Return the primary nameserver from the SOA record
+            return str(soa_answers[0].mname).rstrip('.')
+        return None
+    except Exception as e:
+        logger.error(f"Error getting authoritative nameserver for {domain}: {str(e)}")
+        return None
+
+def get_nameserver_ip(nameserver: str) -> Optional[str]:
+    """
+    Get the IP address for a nameserver.
+    
+    Args:
+        nameserver (str): Nameserver hostname
+        
+    Returns:
+        Optional[str]: IP address or None if not found
+    """
+    try:
+        a_records = dns.resolver.resolve(nameserver, 'A')
+        if a_records:
+            return str(a_records[0])
+        return None
+    except Exception as e:
+        logger.error(f"Error resolving nameserver IP for {nameserver}: {str(e)}")
+        return None
+
+def create_resolver_for_domain(domain: str, query_domain: str) -> dns.resolver.Resolver:
+    """
+    Creates a resolver appropriate for the domain being queried.
+    For subdomains of the main domain, uses the authoritative nameserver.
+    For external domains, uses the default resolver.
+    
+    Args:
+        domain (str): The main domain being checked
+        query_domain (str): The specific domain to query (might be different for CNAME)
+        
+    Returns:
+        dns.resolver.Resolver: Configured resolver
+    """
+    resolver = dns.resolver.Resolver()
+    # Set shorter timeouts for all resolvers
+    resolver.timeout = 2.0  # 2 seconds per attempt
+    resolver.lifetime = 5.0  # 5 seconds total
+    
+    # Check if query_domain is a subdomain of the main domain
+    if query_domain.endswith('.' + domain) or query_domain == domain:
+        # Use authoritative nameserver for this domain
+        try:
+            auth_ns = get_authoritative_nameserver(domain)
+            if auth_ns:
+                ns_ip = get_nameserver_ip(auth_ns)
+                if ns_ip:
+                    resolver.nameservers = [ns_ip]
+                    logger.info(f"Using authoritative nameserver {auth_ns} ({ns_ip}) for {query_domain}")
+                    return resolver
+        except Exception as e:
+            logger.warning(f"Could not use authoritative nameserver for {query_domain}: {str(e)}")
+    
+    # For external domains or if authoritative NS fails, use default resolver
+    logger.info(f"Using default resolver for {query_domain}")
+    return resolver
+
+def get_mx_provider(domain: str) -> Optional[str]:
+    """
+    Determines the email provider based on MX records.
+    
+    Args:
+        domain (str): Domain to check
+        
+    Returns:
+        Optional[str]: Detected provider or None
+    """
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 2.0
+        resolver.lifetime = 5.0
+        
+        mx_records = resolver.resolve(domain, 'MX')
+        
+        for record in mx_records:
+            mx_hostname = str(record.exchange).lower().rstrip('.')
+            
+            # Check for Microsoft
+            if any(microsoft_domain in mx_hostname for microsoft_domain in [
+                "outlook.com", "protection.outlook.com", "mail.protection.outlook.com",
+                "hotmail.com", "microsoft.com"
+            ]):
+                return "Microsoft"
+                
+            # Check for Google
+            if any(google_domain in mx_hostname for google_domain in [
+                "google.com", "googlemail.com", "gmail.com", "aspmx.l.google.com",
+                "alt1.aspmx.l.google.com", "alt2.aspmx.l.google.com", 
+                "aspmx2.googlemail.com", "aspmx3.googlemail.com", "aspmx4.googlemail.com",
+                "aspmx5.googlemail.com"
+            ]):
+                return "Google"
+                
+            # Could add other providers here
+                
+    except Exception as e:
+        logger.error(f"Error determining MX provider for {domain}: {str(e)}")
+        
+    return None
+
+def has_valid_dkim_key(txt_record: str) -> bool:
+    """
+    Checks if a TXT record contains a valid DKIM key.
+    
+    Args:
+        txt_record (str): The TXT record content
+        
+    Returns:
+        bool: True if record contains a valid DKIM key
+    """
+    # Basic validation - must have v=DKIM1 and p= tags
+    return 'v=DKIM1' in txt_record and 'p=' in txt_record
+
+def check_dkim_selector(domain: str, selector: str, follow_cname: bool = True) -> Dict[str, Any]:
+    """
+    Checks a single DKIM selector.
+    
+    Args:
+        domain (str): Domain to check
+        selector (str): DKIM selector to check
+        follow_cname (bool): Whether to follow CNAME records
+        
+    Returns:
+        Dict: Results of the DKIM selector check
+    """
+    result = {
+        "selector": selector,
+        "domain": domain,
+        "fqdn": f"{selector}._domainkey.{domain}",
+        "found": False,
+        "has_valid_key": False,
+        "is_cname": False,
+        "cname_target": None,
+        "txt_record": None,
+        "errors": [],
+        "warnings": []
     }
     
-    # Record types to query
-    record_types = ['A', 'AAAA', 'NS', 'TXT', 'SOA', 'CAA']
-    resolver = dns.resolver.Resolver()
-    resolver.timeout = 5.0  # 5 second timeout
-    resolver.lifetime = 10.0  # 10 second total query time
+    fqdn = f"{selector}._domainkey.{domain}"
     
-    for record_type in record_types:
+    try:
+        # Use appropriate resolver
+        resolver = create_resolver_for_domain(domain, fqdn)
+        
+        # Check for CNAME record first
         try:
-            answers = resolver.resolve(domain, record_type)
+            cname_records = resolver.resolve(fqdn, 'CNAME')
+            cname_target = str(cname_records[0]).rstrip('.')
             
-            if record_type == 'A':
-                results["a_records"] = [str(rdata) for rdata in answers]
-                
-            elif record_type == 'AAAA':
-                results["aaaa_records"] = [str(rdata) for rdata in answers]
-                
-            elif record_type == 'NS':
-                ns_records = []
-                for rdata in answers:
-                    ns_name = str(rdata)
-                    # Get IP for each nameserver
-                    try:
-                        ns_ips = resolver.resolve(ns_name, 'A')
-                        ip_list = [str(ip) for ip in ns_ips]
-                    except DNSException:
-                        ip_list = []
+            result["found"] = True
+            result["is_cname"] = True
+            result["cname_target"] = cname_target
+            
+            # Follow CNAME if requested
+            if follow_cname:
+                try:
+                    # Use default resolver for external domains
+                    cname_resolver = create_resolver_for_domain(domain, cname_target)
+                    txt_records = cname_resolver.resolve(cname_target, 'TXT')
+                    
+                    for txt_record in txt_records:
+                        txt_value = "".join(s.decode() for s in txt_record.strings)
                         
-                    ns_records.append({
-                        "nameserver": ns_name,
-                        "ip_addresses": ip_list
-                    })
-                results["ns_records"] = ns_records
-                
-            elif record_type == 'TXT':
-                txt_records = []
-                for rdata in answers:
-                    # Join TXT record chunks and decode
-                    txt_value = "".join(s.decode() for s in rdata.strings)
-                    txt_records.append(txt_value)
-                results["txt_records"] = txt_records
-                
-            elif record_type == 'SOA':
-                # SOA has only one record
-                soa = answers[0]
-                results["soa_record"] = {
-                    "mname": str(soa.mname),
-                    "rname": str(soa.rname),
-                    "serial": soa.serial,
-                    "refresh": soa.refresh,
-                    "retry": soa.retry,
-                    "expire": soa.expire,
-                    "minimum": soa.minimum
-                }
-                
-            elif record_type == 'CAA':
-                caa_records = []
-                for rdata in answers:
-                    caa_records.append({
-                        "flags": rdata.flags,
-                        "tag": str(rdata.tag),
-                        "value": str(rdata.value).strip('"')
-                    })
-                results["caa_records"] = caa_records
-                
-        except dns.resolver.NoAnswer:
-            logger.debug(f"No {record_type} records found for {domain}")
-            # Not an error, just no records of this type
-            pass
+                        if has_valid_dkim_key(txt_value):
+                            result["txt_record"] = txt_value
+                            result["has_valid_key"] = True
+                            break
+                            
+                    if not result["has_valid_key"]:
+                        result["errors"].append(f"CNAME target {cname_target} does not contain a valid DKIM key")
+                        
+                except Exception as e:
+                    result["errors"].append(f"Error resolving TXT record for CNAME target {cname_target}: {str(e)}")
             
-        except dns.resolver.NXDOMAIN:
-            logger.warning(f"Domain {domain} does not exist")
-            results["errors"].append("Domain does not exist")
-            break  # Stop checking if domain doesn't exist
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+            # No CNAME, try TXT directly
+            try:
+                txt_records = resolver.resolve(fqdn, 'TXT')
+                
+                for txt_record in txt_records:
+                    txt_value = "".join(s.decode() for s in txt_record.strings)
+                    
+                    if has_valid_dkim_key(txt_value):
+                        result["found"] = True
+                        result["txt_record"] = txt_value
+                        result["has_valid_key"] = True
+                        break
+                        
+            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                # No TXT record found
+                pass
+            except Exception as e:
+                result["errors"].append(f"Error resolving TXT record for {fqdn}: {str(e)}")
+                
+    except Exception as e:
+        result["errors"].append(f"Error checking DKIM selector {selector} for {domain}: {str(e)}")
+        
+    return result
+
+def check_dkim_selectors(domain: str, selectors: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    Checks DKIM selectors for a domain and validates both Microsoft and Google selectors.
+    
+    Args:
+        domain (str): Domain to check
+        selectors (List[str], optional): List of selectors to check. If None, checks defaults.
+        
+    Returns:
+        Dict: Dictionary containing DKIM check results
+    """
+    results = {
+        "domain": domain,
+        "selectors_checked_count": 0,
+        "selectors_found": [],
+        "mx_provider_detected": None,
+        "records": {},
+        "errors": [],
+        "warnings": [],
+        "recommendations": []
+    }
+    
+    try:
+        # Try to determine email provider from MX records
+        mx_provider = get_mx_provider(domain)
+        results["mx_provider_detected"] = mx_provider
+        
+        # Keep track of which selectors were explicitly requested
+        explicit_selectors = set(selectors) if selectors else set()
+        
+        # Determine which selectors to check
+        if selectors:
+            # User specified selectors - check only those
+            selectors_to_check = selectors
+        else:
+            # Always check both Microsoft and Google selectors, plus common ones
+            selectors_to_check = PROVIDER_GROUPS["Microsoft"] + PROVIDER_GROUPS["Google"] + [
+                "default", "dkim", "k1", "mail", "sendgrid", "amazonses"
+            ]
+        
+        results["selectors_checked_count"] = len(selectors_to_check)
+        
+        # Track selectors actually found
+        found_selectors = []
+        valid_selectors = []
+        
+        # Store provider-specific status
+        microsoft_found = []
+        microsoft_valid = []
+        google_found = []
+        google_valid = []
+        
+        # Check each selector
+        for selector in selectors_to_check:
+            try:
+                selector_result = check_dkim_selector(domain, selector)
+                
+                # If found, track it
+                if selector_result["found"]:
+                    found_selectors.append(selector)
+                    
+                    # Check if it has a valid key
+                    if selector_result["has_valid_key"]:
+                        valid_selectors.append(selector)
+                        
+                        # Add to records dictionary (always include valid selectors)
+                        results["records"][selector] = selector_result
+                        
+                    else:
+                        # Found but invalid - issue a warning
+                        results["warnings"].append(f"Selector {selector} found but does not contain a valid DKIM key")
+                        
+                        # Include in output if it's Microsoft, Google, or explicitly requested
+                        if (selector in PROVIDER_GROUPS["Microsoft"] or 
+                            selector in PROVIDER_GROUPS["Google"] or 
+                            selector in explicit_selectors):
+                            results["records"][selector] = selector_result
+                    
+                    # Track Microsoft selectors
+                    if selector in PROVIDER_GROUPS["Microsoft"]:
+                        microsoft_found.append(selector)
+                        if selector_result["has_valid_key"]:
+                            microsoft_valid.append(selector)
+                            
+                    # Track Google selectors
+                    if selector in PROVIDER_GROUPS["Google"]:
+                        google_found.append(selector)
+                        if selector_result["has_valid_key"]:
+                            google_valid.append(selector)
+                
+            except Exception as e:
+                logger.error(f"Error checking selector {selector}: {str(e)}")
+                # Don't include errors for selectors that failed in the output
+        
+        # Update selectors_found with actually found selectors
+        results["selectors_found"] = found_selectors
+        
+        # Add provider-specific information only if relevant
+        results["provider_status"] = {}
+        
+        # Only include Microsoft status if Microsoft selectors were found or MX is Microsoft
+        if microsoft_found or mx_provider == "Microsoft":
+            results["provider_status"]["Microsoft"] = {
+                "selectors_found": microsoft_found,
+                "selectors_valid": microsoft_valid,
+                "configured": len(microsoft_valid) > 0
+            }
             
-        except dns.resolver.Timeout:
-            logger.warning(f"Timeout querying {record_type} records for {domain}")
-            results["errors"].append(f"Timeout querying {record_type} records")
+        # Only include Google status if Google selectors were found or MX is Google
+        if google_found or mx_provider == "Google":
+            results["provider_status"]["Google"] = {
+                "selectors_found": google_found,
+                "selectors_valid": google_valid,
+                "configured": len(google_valid) > 0
+            }
+        
+        # Provider-specific recommendations
+        # If MX is Microsoft but Microsoft DKIM is not configured
+        if mx_provider == "Microsoft" and (not microsoft_valid):
+            if not microsoft_found:
+                results["errors"].append("Microsoft MX detected but no Microsoft DKIM selectors found")
+                results["recommendations"].append("Add Microsoft DKIM selectors: selector1 and selector2")
+            else:
+                results["errors"].append("Microsoft MX detected but Microsoft DKIM selectors don't have valid keys")
+                results["recommendations"].append("Configure valid DKIM keys for Microsoft selectors")
+                
+        # If MX is Google but Google DKIM is not configured
+        elif mx_provider == "Google" and (not google_valid):
+            if not google_found:
+                results["errors"].append("Google MX detected but no Google DKIM selectors found")
+                results["recommendations"].append("Add at least one Google DKIM selector (google, s1, or s2)")
+            else:
+                results["errors"].append("Google MX detected but Google DKIM selectors don't have valid keys")
+                results["recommendations"].append("Configure valid DKIM keys for Google selectors")
+        
+        # If no DKIM is configured at all
+        if not found_selectors:
+            results["errors"].append("No DKIM selectors found")
+            results["recommendations"].append("Implement DKIM to improve email deliverability and security")
+        elif not valid_selectors:
+            results["errors"].append("DKIM selectors found but none have valid keys")
+            results["recommendations"].append("Ensure DKIM selectors have valid keys")
             
-        except Exception as e:
-            logger.error(f"Error querying {record_type} records for {domain}: {str(e)}")
-            results["errors"].append(f"Error querying {record_type} records: {str(e)}")
+        # Add stats about found selectors
+        results["stats"] = {
+            "selectors_found_count": len(found_selectors),
+            "selectors_with_valid_keys": len(valid_selectors),
+            "status": "configured" if valid_selectors else "missing"
+        }
+            
+    except Exception as e:
+        results["errors"].append(f"Error checking DKIM selectors: {str(e)}")
+    
+    # Ensure the result is JSON serializable
+    try:
+        json.dumps(results)
+    except (TypeError, OverflowError) as e:
+        logger.error(f"JSON serialization error: {str(e)}")
+        # Return a simplified version that will serialize
+        return {
+            "domain": domain,
+            "selectors_checked_count": results.get("selectors_checked_count", 0),
+            "selectors_found": results.get("selectors_found", []),
+            "mx_provider_detected": results.get("mx_provider_detected"),
+            "errors": results.get("errors", []) + ["JSON serialization error"],
+            "warnings": results.get("warnings", []),
+            "recommendations": results.get("recommendations", [])
+        }
     
     return results

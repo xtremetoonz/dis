@@ -1,8 +1,10 @@
 import os
 from dotenv import load_dotenv
-from flask import Flask
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import logging
+from backend.utils.logging import configure_logging
+from backend.api.limiter import configure_limiter
 
 # Load environment variables
 load_dotenv()
@@ -31,6 +33,9 @@ def create_app(test_config=None):
     # Enable CORS
     CORS(app)
     
+    # Configure logging
+    configure_logging(app, os.getenv('LOG_LEVEL', 'INFO'))
+
     # Load configuration
     app.config.from_mapping(
         SECRET_KEY=os.getenv("SECRET_KEY", "dev"),
@@ -54,7 +59,10 @@ def create_app(test_config=None):
     # Register blueprints
     from backend.api.routes import api_bp
     app.register_blueprint(api_bp)
-    
+
+    # configure rate limiting
+    configure_limiter(app)
+
     # Register error handlers
     @app.errorhandler(404)
     def not_found(e):
@@ -78,8 +86,7 @@ def create_app(test_config=None):
         """Simple health check endpoint"""
         return jsonify({
             "status": "ok",
-            "version": app.config["API_VERSION"],
-            "environment": app.config["ENVIRONMENT"]
+            "message": "API is operational"
         })
     
     logger.info(f"Application initialized in {app.config['ENVIRONMENT']} mode")
