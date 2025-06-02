@@ -1,101 +1,144 @@
-import os
-from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, Blueprint, jsonify, request
 from flask_cors import CORS
+import os
 import logging
+from werkzeug.middleware.proxy_fix import ProxyFix
+from datetime import datetime
+import uuid
+
+# Import utility modules
+from backend.utils.errors import register_error_handlers, APIError
+from backend.utils.limiter import limiter, configure_limiter
 from backend.utils.logging import configure_logging
-from backend.api.limiter import configure_limiter
+from backend.utils.security import init_security, api_security
 
-# Load environment variables
-load_dotenv()
+# Import route modules
+from backend.routes import api_bp
 
-# Configure logging
-logging_level = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(
-    level=getattr(logging, logging_level),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-def create_app(test_config=None):
+def create_app(config=None):
     """
-    Application factory function.
+    Create and configure the Flask application
     
     Args:
-        test_config (dict, optional): Test configuration to override defaults
+        config: Configuration object or dictionary
         
     Returns:
-        Flask: Configured Flask application
+        Flask application instance
     """
     # Create Flask app
-    app = Flask(__name__, instance_relative_config=True)
+    app = Flask(__name__)
     
-    # Enable CORS
-    CORS(app)
+    # Fix for running behind proxy
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
     
-    # Configure logging
-    configure_logging(app, os.getenv('LOG_LEVEL', 'INFO'))
-
     # Load configuration
-    app.config.from_mapping(
-        SECRET_KEY=os.getenv("SECRET_KEY", "dev"),
-        API_VERSION="v1",
-        DNS_TIMEOUT=float(os.getenv("DNS_TIMEOUT", "5.0")),
-        HTTP_TIMEOUT=float(os.getenv("HTTP_TIMEOUT", "10.0")),
-        CERT_SPOTTER_API_KEY=os.getenv("CERTSPOTTER_API_KEY", ""),
-        ENVIRONMENT=os.getenv("FLASK_ENV", "production")
-    )
+    app.config.from_object('backend.config.Config')
     
-    # Override config with test config if provided
-    if test_config:
-        app.config.update(test_config)
+    # Override with environment variable config
+    app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', app.config.get('SECRET_KEY', 'dev-key'))
+    app.config['LOG_LEVEL'] = os.environ.get('LOG_LEVEL', app.config.get('LOG_LEVEL', 'INFO'))
+    app.config['API_SIGNING_REQUIRED'] = os.environ.get('API_SIGNING_REQUIRED', 'False').lower() in ('true', '1', 't')
+    app.config['RATE_LIMIT_DEFAULT'] = os.environ.get('RATE_LIMIT_DEFAULT', "200 per day, 50 per hour")
     
-    # Ensure the instance folder exists
-    try:
-        os.makedirs(app.instance_path)
-    except OSError:
-        pass
+    # Apply any provided configuration override
+    if config:
+        if isinstance(config, dict):
+            app.config.update(config)
+        else:
+            app.config.from_object(config)
+    
+    # Set up logging
+    logger = configure_logging(app)
+    
+    # Initialize security
+    init_security(app)
+    
+    # Configure rate limiter
+    configure_limiter(app)
+    
+    # Register error handlers
+    register_error_handlers(app)
+    
+    # Set up CORS
+    cors_origins = os.environ.get('CORS_ORIGINS', '*')
+    CORS(app, resources={r"/api/*": {"origins": cors_origins.split(',')}})
     
     # Register blueprints
-    from backend.api.routes import api_bp
     app.register_blueprint(api_bp)
-
-    # configure rate limiting
-    configure_limiter(app)
-
-    # Register error handlers
-    @app.errorhandler(404)
-    def not_found(e):
-        logger.info(f"404 error: {request.path}")
-        return jsonify({
-            "status": "error",
-            "message": "Resource not found"
-        }), 404
     
-    @app.errorhandler(500)
-    def server_error(e):
-        logger.error(f"500 error: {str(e)}")
-        return jsonify({
-            "status": "error",
-            "message": "Internal server error"
-        }), 500
-    
-    # Debug route
+    # Add health check endpoint
     @app.route('/health')
     def health_check():
-        """Simple health check endpoint"""
         return jsonify({
             "status": "ok",
-            "message": "API is operational"
+            "timestamp": datetime.utcnow().isoformat(),
+            "version": app.config.get('VERSION', '1.0.0'),
+            "environment": app.config.get('ENV', 'production')
         })
     
-    logger.info(f"Application initialized in {app.config['ENVIRONMENT']} mode")
+    # Add API key info endpoint (protected)
+    @app.route('/api/v1/auth/verify', methods=['GET'])
+    @api_security.require_api_key
+    def verify_auth():
+        return jsonify({
+            "status": "success",
+            "authenticated": True,
+            "client_id": request.client_id,
+            "client_name": request.client_name,
+            "message": f"Authentication successful for {request.client_name}"
+        })
+    
+    # Add startup log entry
+    logger.info(f"Application started in {app.config.get('ENV', 'production')} mode")
+    
+    # Log the application configuration (excluding sensitive values)
+    safe_config = {
+        key: value for key, value in app.config.items() 
+        if not any(sensitive in key.lower() for sensitive in ['key', 'password', 'secret', 'token'])
+    }
+    logger.debug(f"Application configuration: {safe_config}")
+    
     return app
 
-# Simple CLI for running the app directly
-if __name__ == '__main__':
-    app = create_app()
-    port = int(os.getenv("PORT", "5000"))
-    debug = os.getenv("FLASK_ENV", "production") == "development"
+def init_db(app):
+    """
+    Initialize database for the application
+    This is a placeholder for future database integration
     
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    Args:
+        app: Flask application instance
+    """
+    # This function would initialize database connections, 
+    # create tables if needed, and perform other database setup
+    pass
+
+# Request ID middleware for tracking requests
+class RequestIDMiddleware:
+    """Middleware that assigns a unique ID to each request"""
+    
+    def __init__(self, app):
+        self.app = app
+        
+    def __call__(self, environ, start_response):
+        request_id = str(uuid.uuid4())
+        environ['REQUEST_ID'] = request_id
+        
+        def custom_start_response(status, headers, exc_info=None):
+            headers.append(('X-Request-ID', request_id))
+            return start_response(status, headers, exc_info)
+            
+        return self.app(environ, custom_start_response)
+
+# For directly running the application
+if __name__ == '__main__':
+    # Create the application
+    app = create_app()
+    
+    # Add the request ID middleware
+    app.wsgi_app = RequestIDMiddleware(app.wsgi_app)
+    
+    # Get port from environment or use default
+    port = int(os.environ.get('PORT', 5000))
+    
+    # Run the application
+    app.run(host='0.0.0.0', port=port, debug=app.config.get('DEBUG', False))

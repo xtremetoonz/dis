@@ -381,148 +381,197 @@ def count_dns_lookups(parsed: Dict[str, Any], domain: str, visited: Set[str] = N
     
     return result
 
-def get_spf_record(domain: str) -> Dict[str, Any]:
+def grade_spf_policy(results: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Retrieves and parses the SPF record for a domain using authoritative nameserver.
+    Assigns a grade to the SPF policy based on its configuration quality.
+    
+    Args:
+        results (Dict): SPF check results including parsed record and analysis
+        
+    Returns:
+        Dict: Grading information with letter grade and description
+    """
+    # Initialize with a default grade
+    grade = {
+        "grade": "C",
+        "score": 5.0,
+        "description": "Average SPF configuration"
+    }
+    
+    # If SPF record is missing or has errors, assign F grade
+    if not results.get("record"):
+        grade["grade"] = "F"
+        grade["score"] = 0.0
+        grade["description"] = "No SPF record found"
+        return grade
+    
+    if not results.get("parsed"):
+        grade["grade"] = "F"
+        grade["score"] = 0.0
+        grade["description"] = "SPF record is invalid or unparseable"
+        return grade
+    
+    # Start with baseline score
+    score = 5.0
+    
+    # Get parsed record and lookup counts
+    parsed = results.get("parsed", {})
+    lookup_count = results.get("lookup_count", {})
+    
+    # --- Score SPF enforcement (all mechanism) ---
+    all_qualifier = parsed.get("all_qualifier")
+    if all_qualifier == "fail":
+        # Hard fail is optimal
+        score += 2.0
+    elif all_qualifier == "softfail":
+        # Softfail is good but not optimal
+        score += 1.0
+    elif all_qualifier == "neutral":
+        # Neutral provides minimal protection
+        score -= 1.0
+    elif all_qualifier == "pass":
+        # Pass is effectively no protection at all
+        score -= 2.0
+    else:
+        # Missing 'all' mechanism is a serious issue
+        score -= 3.0
+    
+    # --- Score DNS lookup usage ---
+    total_lookups = lookup_count.get("total", 0)
+    if total_lookups > 10:
+        # Exceeding 10 lookups is a critical issue
+        score -= 3.0
+    elif total_lookups > 8:
+        # Approaching the limit is concerning
+        score -= 1.0
+    elif total_lookups < 5:
+        # Efficient SPF record with few lookups is good
+        score += 0.5
+    
+    # --- Score mechanism usage ---
+    mechanisms = parsed.get("mechanisms", [])
+    includes = parsed.get("includes", [])
+    ip_mechanisms = len(parsed.get("ip4", [])) + len(parsed.get("ip6", []))
+    
+    # Having explicit IP blocks is good
+    if ip_mechanisms > 0:
+        score += 0.5
+    
+    # Check if using both 'all' and 'redirect' (problematic)
+    if parsed.get("all_mechanism") and parsed.get("redirect"):
+        score -= 1.0
+    
+    # Check for potentially overly permissive mechanisms
+    has_overly_permissive = False
+    for mechanism in mechanisms:
+        if mechanism["type"] in ["ip4", "ip6"] and mechanism.get("value") == "0.0.0.0/0":
+            has_overly_permissive = True
+            break
+    
+    if has_overly_permissive:
+        score -= 2.0
+    
+    # --- Check for include loops ---
+    if any("Loop detected" in error for error in lookup_count.get("errors", [])):
+        score -= 2.0
+    
+    # --- Final grading calculation ---
+    grade["score"] = round(max(0.0, min(10.0, score)), 1)  # Clamp between 0-10
+    
+    # Determine letter grade based on score
+    if score >= 9.0:
+        grade["grade"] = "A+"
+        grade["description"] = "Excellent SPF configuration"
+    elif score >= 8.0:
+        grade["grade"] = "A"
+        grade["description"] = "Very good SPF configuration"
+    elif score >= 7.0:
+        grade["grade"] = "B+"
+        grade["description"] = "Good SPF configuration"
+    elif score >= 6.0:
+        grade["grade"] = "B"
+        grade["description"] = "Above average SPF configuration"
+    elif score >= 5.0:
+        grade["grade"] = "C+"
+        grade["description"] = "Decent SPF configuration"
+    elif score >= 4.0:
+        grade["grade"] = "C"
+        grade["description"] = "Average SPF configuration"
+    elif score >= 3.0:
+        grade["grade"] = "D"
+        grade["description"] = "Below average SPF configuration"
+    elif score >= 2.0:
+        grade["grade"] = "D-"
+        grade["description"] = "Poor SPF configuration"
+    else:
+        grade["grade"] = "F"
+        grade["description"] = "Failing SPF configuration"
+    
+    # Additional detail for specific issues
+    if not all_qualifier:
+        grade["description"] += " (missing 'all' mechanism)"
+    elif all_qualifier == "pass":
+        grade["description"] += " (using ineffective '+all')"
+    
+    if total_lookups > 10:
+        grade["description"] += f" (exceeds lookup limit with {total_lookups} lookups)"
+    
+    return grade
+
+def get_spf_record_from_ns(domain: str, nameserver: str) -> Dict[str, Any]:
+    """
+    Retrieves SPF record from a specific nameserver.
     
     Args:
         domain (str): The domain to query
+        nameserver (str): The nameserver to query
         
     Returns:
-        Dict: Dictionary containing the SPF record data and analysis
+        Dict: SPF record information
     """
     results = {
         "record": None,
-        "parsed": None,
-        "record_count": 0,
-        "lookup_count": None,
-        "authoritative_nameserver": None,
-        "errors": [],
-        "warnings": [],
-        "recommendations": []
+        "nameserver": nameserver,
+        "errors": []
     }
     
     try:
-        # Get authoritative resolver
-        resolver = create_auth_resolver(domain)
-        
-        # Store the authoritative nameserver info if available
-        auth_ns = get_authoritative_nameserver(domain)
-        if auth_ns:
-            results["authoritative_nameserver"] = auth_ns
-        
-        # Look for TXT records
-        try:
-            answers = resolver.resolve(domain, 'TXT')
+        # Get the IP address of the nameserver
+        ns_ip = get_nameserver_ip(nameserver)
+        if not ns_ip:
+            results["errors"].append(f"Could not resolve IP for nameserver {nameserver}")
+            return results
             
-            # Count all TXT records
-            results["record_count"] = len(answers)
+        # Create a resolver using this nameserver
+        resolver = dns.resolver.Resolver()
+        resolver.nameservers = [ns_ip]
+        resolver.timeout = 5.0
+        resolver.lifetime = 10.0
+        
+        try:
+            # Query TXT records
+            answers = resolver.resolve(domain, 'TXT')
             
             # Find SPF record
             for rdata in answers:
                 txt_value = "".join(s.decode() for s in rdata.strings)
                 
                 if txt_value.startswith('v=spf1'):
-                    if results["record"]:
-                        # Found multiple SPF records - this is invalid
-                        results["errors"].append("Multiple SPF records found - this is invalid")
-                        results["recommendations"].append("Remove duplicate SPF records and keep only one")
-                    
                     results["record"] = txt_value
+                    break
                     
-            # No SPF record found
-            if not results["record"]:
-                results["errors"].append("No SPF record found")
-                results["recommendations"].append("Implement an SPF record to protect against email spoofing")
-                return results
-                
-            # Parse the SPF record
-            results["parsed"] = parse_spf_record(results["record"])
-            
-            # Check if parsing was successful
-            if not results["parsed"]:
-                results["errors"].append("Failed to parse SPF record")
-                results["recommendations"].append("Verify SPF record syntax")
-                return results
-                
-            # Count DNS lookups
-            results["lookup_count"] = count_dns_lookups(results["parsed"], domain)
-            
-            # --- Validations and Recommendations ---
-            
-            # Check DNS lookup limit
-            total_lookups = results["lookup_count"].get("total", 0)
-            if total_lookups > 10:
-                results["errors"].append(f"SPF record exceeds 10 DNS lookup limit ({total_lookups})")
-                results["recommendations"].append("Reduce the number of DNS lookups by consolidating includes or using ip4/ip6")
-            elif total_lookups > 8:
-                results["warnings"].append(f"SPF record has {total_lookups} DNS lookups (approaching the limit of 10)")
-                results["recommendations"].append("Consider optimizing SPF record to reduce DNS lookups")
-            
-            # Check 'all' mechanism
-            if not results["parsed"].get("all_mechanism"):
-                results["warnings"].append("No 'all' mechanism found - this is required")
-                results["recommendations"].append("Add '-all' at the end of your SPF record")
-            elif results["parsed"].get("all_qualifier") not in ["fail", "softfail"]:
-                results["warnings"].append(f"'all' qualifier is set to '{results['parsed'].get('all_qualifier')}' - this is weak")
-                results["recommendations"].append("Use '-all' (hard fail) for stronger protection")
-            
-            # Check for 'redirect' and 'all' together (invalid)
-            if results["parsed"].get("redirect") and results["parsed"].get("all_mechanism"):
-                results["warnings"].append("Having both 'redirect' and 'all' in the same record may cause issues")
-                results["recommendations"].append("Remove 'all' directive when using 'redirect'")
-            
-            # Check for potentially risky mechanisms
-            for mechanism in results["parsed"].get("mechanisms", []):
-                # Check for overly permissive mechanisms
-                if mechanism["type"] in ["ip4", "ip6"] and mechanism["value"] == "0.0.0.0/0":
-                    results["warnings"].append(f"Overly permissive IP range {mechanism['value']}")
-                    results["recommendations"].append("Specify exact IP ranges instead of allowing all IPs")
-                
-                # Check for external includes that might not be under your control
-                if mechanism["type"] == "include" and any(ext in mechanism["value"] for ext in [
-                    "gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "aol.com"
-                ]):
-                    results["warnings"].append(f"Including policy from external provider: {mechanism['value']}")
-                    
-            # Check for include loops
-            if results["lookup_count"].get("errors"):
-                for error in results["lookup_count"].get("errors", []):
-                    if "Loop detected" in error:
-                        results["errors"].append(error)
-                        results["recommendations"].append("Fix circular 'include' references in SPF record")
-                
         except dns.resolver.NoAnswer:
             results["errors"].append("No TXT records found")
-            results["recommendations"].append("Implement an SPF record to protect against email spoofing")
-            
         except dns.resolver.NXDOMAIN:
             results["errors"].append("Domain does not exist")
-            
         except dns.resolver.Timeout:
-            results["errors"].append("DNS timeout")
-            
+            results["errors"].append("DNS query timeout")
         except Exception as e:
-            logger.error(f"Error resolving TXT records: {str(e)}")
-            results["errors"].append(f"Error resolving TXT records: {str(e)}")
+            results["errors"].append(f"Error querying TXT records: {str(e)}")
             
     except Exception as e:
-        logger.error(f"Error retrieving SPF record for {domain}: {str(e)}")
         results["errors"].append(f"Error retrieving SPF record: {str(e)}")
-    
-    # Ensure the result is JSON serializable
-    try:
-        json.dumps(results)
-    except (TypeError, OverflowError) as e:
-        logger.error(f"JSON serialization error: {str(e)}")
-        # Return a simplified version that will serialize
-        return {
-            "record": results.get("record"),
-            "errors": results.get("errors", []) + ["JSON serialization error"],
-            "warnings": results.get("warnings", []),
-            "recommendations": results.get("recommendations", [])
-        }
-    
+        
     return results
 
 def analyze_spf_policy(spf_record: Dict[str, Any]) -> Dict[str, Any]:
@@ -679,62 +728,6 @@ def analyze_spf_policy(spf_record: Dict[str, Any]) -> Dict[str, Any]:
     result["lookup_insights"] = lookup_insights
     
     return result
-
-def get_spf_record_from_ns(domain: str, nameserver: str) -> Dict[str, Any]:
-    """
-    Retrieves SPF record from a specific nameserver.
-    
-    Args:
-        domain (str): The domain to query
-        nameserver (str): The nameserver to query
-        
-    Returns:
-        Dict: SPF record information
-    """
-    results = {
-        "record": None,
-        "nameserver": nameserver,
-        "errors": []
-    }
-    
-    try:
-        # Get the IP address of the nameserver
-        ns_ip = get_nameserver_ip(nameserver)
-        if not ns_ip:
-            results["errors"].append(f"Could not resolve IP for nameserver {nameserver}")
-            return results
-            
-        # Create a resolver using this nameserver
-        resolver = dns.resolver.Resolver()
-        resolver.nameservers = [ns_ip]
-        resolver.timeout = 5.0
-        resolver.lifetime = 10.0
-        
-        try:
-            # Query TXT records
-            answers = resolver.resolve(domain, 'TXT')
-            
-            # Find SPF record
-            for rdata in answers:
-                txt_value = "".join(s.decode() for s in rdata.strings)
-                
-                if txt_value.startswith('v=spf1'):
-                    results["record"] = txt_value
-                    break
-                    
-        except dns.resolver.NoAnswer:
-            results["errors"].append("No TXT records found")
-        except dns.resolver.NXDOMAIN:
-            results["errors"].append("Domain does not exist")
-        except dns.resolver.Timeout:
-            results["errors"].append("DNS query timeout")
-        except Exception as e:
-            results["errors"].append(f"Error querying TXT records: {str(e)}")
-            
-    except Exception as e:
-        results["errors"].append(f"Error retrieving SPF record: {str(e)}")
-        
-    return results
 
 def get_spf_record(domain: str) -> Dict[str, Any]:
     """
