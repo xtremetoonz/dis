@@ -6,14 +6,208 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime
 import uuid
 
-# Import utility modules
-from backend.utils.errors import register_error_handlers, APIError
-from backend.utils.limiter import limiter, configure_limiter
-from backend.utils.logging import configure_logging
-from backend.utils.security import init_security, api_security
+# Import utility modules - adjust these imports to match your project structure
+# Use relative imports or absolute imports based on your project layout
+try:
+    # Try your existing error handling module first
+    from errors import register_error_handlers, APIError
+except ImportError:
+    # Fallback - your existing errors module might be at a different path
+    try:
+        from backend.modules.errors import register_error_handlers, APIError
+    except ImportError:
+        # If we can't find it, use a simple version
+        from werkzeug.exceptions import HTTPException
+        
+        class APIError(Exception):
+            """Base class for API errors"""
+            status_code = 500
+            
+            def __init__(self, message, status_code=None, payload=None):
+                super().__init__()
+                self.message = message
+                if status_code is not None:
+                    self.status_code = status_code
+                self.payload = payload
+                
+            def to_dict(self):
+                rv = dict(self.payload or ())
+                rv['status'] = 'error'
+                rv['message'] = self.message
+                return rv
+        
+        def register_error_handlers(app):
+            """Register error handlers for the Flask app"""
+            
+            @app.errorhandler(APIError)
+            def handle_api_error(error):
+                response = jsonify(error.to_dict())
+                response.status_code = error.status_code
+                return response
+            
+            @app.errorhandler(404)
+            def not_found(error):
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Resource not found'
+                }), 404
+            
+            @app.errorhandler(500)
+            def server_error(error):
+                app.logger.error(f"Server error: {str(error)}")
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Internal server error'
+                }), 500
+            
+            @app.errorhandler(Exception)
+            def handle_unexpected_error(error):
+                app.logger.error(f"Unexpected error: {str(error)}", exc_info=True)
+                return jsonify({
+                    'status': 'error',
+                    'message': 'An unexpected error occurred'
+                }), 500
 
-# Import route modules
-from backend.routes import api_bp
+# Import API security components - create these files in your project structure
+from api_security import ApiSecurity
+
+# Create the security module
+api_security = ApiSecurity()
+
+def init_security(app):
+    """
+    Initialize API security for the application
+    
+    Args:
+        app: Flask application instance
+    """
+    # Load API keys from environment or config
+    api_keys = {}
+    
+    # Method 1: Load from environment variables
+    # Format: API_KEY_NAME=key:client_id:client_name:secret_key
+    for env_var, value in os.environ.items():
+        if env_var.startswith('API_KEY_'):
+            try:
+                parts = value.split(':')
+                if len(parts) >= 4:
+                    key, client_id, client_name, secret_key = parts[:4]
+                    api_keys[key] = {
+                        'id': client_id,
+                        'name': client_name,
+                        'secret_key': secret_key
+                    }
+            except Exception as e:
+                app.logger.error(f"Error parsing API key from environment: {e}")
+    
+    # Method 2: Load from config file (if available)
+    config_keys = app.config.get('API_KEYS', {})
+    api_keys.update(config_keys)
+    
+    # If no keys defined, create a development key if in debug mode
+    if not api_keys and app.debug:
+        app.logger.warning("No API keys defined. Creating a development key.")
+        dev_credentials = api_security.generate_client_credentials("development")
+        api_keys[dev_credentials["api_key"]] = {
+            'id': dev_credentials["client_id"],
+            'name': dev_credentials["client_name"],
+            'secret_key': dev_credentials["secret_key"]
+        }
+        app.logger.info(f"Development API Key: {dev_credentials['api_key']}")
+        app.logger.info(f"Development Secret Key: {dev_credentials['secret_key']}")
+    
+    # Store the keys in config
+    app.config['API_KEYS'] = api_keys
+    
+    # Initialize security with the app
+    api_security.init_app(app)
+    
+    # Log the number of loaded keys
+    app.logger.info(f"Loaded {len(api_keys)} API keys")
+
+# Simplified limiter implementation
+limiter = None
+def configure_limiter(app):
+    """
+    Configure rate limiting for the application
+    
+    Args:
+        app: Flask application instance
+    """
+    try:
+        # Try to import flask-limiter
+        from flask_limiter import Limiter
+        from flask_limiter.util import get_remote_address
+        
+        # Create a new limiter instance
+        global limiter
+        limiter = Limiter(
+            get_remote_address,
+            app=app,
+            default_limits=["200 per day", "50 per hour"],
+            storage_uri="memory://",
+        )
+        
+        # Log that it was configured successfully
+        app.logger.info("Rate limiter configured")
+        
+        # Register error handler for rate limit exceeded
+        @app.errorhandler(429)
+        def ratelimit_handler(e):
+            app.logger.warning(f"Rate limit exceeded: {e.description}")
+            return {
+                "status": "error",
+                "message": "Rate limit exceeded",
+                "details": e.description
+            }, 429
+    except ImportError:
+        # Flask-Limiter might not be installed, just log a warning
+        app.logger.warning("Flask-Limiter not installed, rate limiting disabled")
+
+def configure_logging(app):
+    """
+    Configure application logging
+    
+    Args:
+        app: Flask application instance
+        
+    Returns:
+        Logger instance
+    """
+    # Get log level from config or env
+    log_level_name = app.config.get('LOG_LEVEL', 'INFO')
+    log_level = getattr(logging, log_level_name.upper(), logging.INFO)
+    
+    # Configure root logger
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+    
+    # Configure Flask logger
+    app.logger.setLevel(log_level)
+    
+    # Ensure all Flask's loggers are properly set
+    for logger in [
+        logging.getLogger('werkzeug'),
+        logging.getLogger('flask'),
+    ]:
+        logger.setLevel(log_level)
+        
+    return app.logger
+
+# Import your routes
+# Adapt this import to match your existing routes
+try:
+    from backend.api.routes import api_bp
+except ImportError:
+    # Create a minimal blueprint if your routes are elsewhere
+    api_bp = Blueprint('api', __name__, url_prefix='/api/v1')
+    
+    @api_bp.route('/health')
+    def api_health():
+        return jsonify({"status": "ok"})
 
 def create_app(config=None):
     """
@@ -31,14 +225,21 @@ def create_app(config=None):
     # Fix for running behind proxy
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
     
-    # Load configuration
-    app.config.from_object('backend.config.Config')
+    # Basic configuration - adjust for your project structure
+    app.config.update({
+        'SECRET_KEY': os.environ.get('SECRET_KEY', 'dev-key'),
+        'LOG_LEVEL': os.environ.get('LOG_LEVEL', 'INFO'),
+        'API_SIGNING_REQUIRED': os.environ.get('API_SIGNING_REQUIRED', 'False').lower() in ('true', '1', 't'),
+        'RATE_LIMIT_DEFAULT': os.environ.get('RATE_LIMIT_DEFAULT', "200 per day, 50 per hour"),
+        'DEBUG': os.environ.get('FLASK_DEBUG', 'False').lower() in ('true', '1', 't'),
+    })
     
-    # Override with environment variable config
-    app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', app.config.get('SECRET_KEY', 'dev-key'))
-    app.config['LOG_LEVEL'] = os.environ.get('LOG_LEVEL', app.config.get('LOG_LEVEL', 'INFO'))
-    app.config['API_SIGNING_REQUIRED'] = os.environ.get('API_SIGNING_REQUIRED', 'False').lower() in ('true', '1', 't')
-    app.config['RATE_LIMIT_DEFAULT'] = os.environ.get('RATE_LIMIT_DEFAULT', "200 per day, 50 per hour")
+    # Try loading configuration from a Config class if available
+    try:
+        from config import Config
+        app.config.from_object(Config)
+    except ImportError:
+        app.logger.warning("Config module not found, using default configuration")
     
     # Apply any provided configuration override
     if config:
@@ -91,51 +292,12 @@ def create_app(config=None):
     # Add startup log entry
     logger.info(f"Application started in {app.config.get('ENV', 'production')} mode")
     
-    # Log the application configuration (excluding sensitive values)
-    safe_config = {
-        key: value for key, value in app.config.items() 
-        if not any(sensitive in key.lower() for sensitive in ['key', 'password', 'secret', 'token'])
-    }
-    logger.debug(f"Application configuration: {safe_config}")
-    
     return app
-
-def init_db(app):
-    """
-    Initialize database for the application
-    This is a placeholder for future database integration
-    
-    Args:
-        app: Flask application instance
-    """
-    # This function would initialize database connections, 
-    # create tables if needed, and perform other database setup
-    pass
-
-# Request ID middleware for tracking requests
-class RequestIDMiddleware:
-    """Middleware that assigns a unique ID to each request"""
-    
-    def __init__(self, app):
-        self.app = app
-        
-    def __call__(self, environ, start_response):
-        request_id = str(uuid.uuid4())
-        environ['REQUEST_ID'] = request_id
-        
-        def custom_start_response(status, headers, exc_info=None):
-            headers.append(('X-Request-ID', request_id))
-            return start_response(status, headers, exc_info)
-            
-        return self.app(environ, custom_start_response)
 
 # For directly running the application
 if __name__ == '__main__':
     # Create the application
     app = create_app()
-    
-    # Add the request ID middleware
-    app.wsgi_app = RequestIDMiddleware(app.wsgi_app)
     
     # Get port from environment or use default
     port = int(os.environ.get('PORT', 5000))
