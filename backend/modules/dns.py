@@ -37,30 +37,22 @@ def get_authoritative_nameserver(domain: str) -> Optional[str]:
 
 def get_nameserver_ips(nameserver: str) -> List[str]:
     """
-    Get IP addresses for a nameserver.
+    Get IPv4 addresses for a nameserver.
     
     Args:
         nameserver (str): Nameserver hostname
         
     Returns:
-        List[str]: List of IP addresses
+        List[str]: List of IPv4 addresses
     """
     ips = []
     try:
-        # Try IPv4 addresses
+        # Only try IPv4 addresses
         a_records = dns.resolver.resolve(nameserver, 'A')
         for record in a_records:
             ips.append(str(record))
-    except Exception:
-        # Ignore errors, try IPv6
-        pass
-        
-    try:
-        # Try IPv6 addresses
-        aaaa_records = dns.resolver.resolve(nameserver, 'AAAA')
-        for record in aaaa_records:
-            ips.append(str(record))
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Error resolving IPv4 for nameserver {nameserver}: {str(e)}")
         # Ignore errors
         pass
         
@@ -278,7 +270,8 @@ def check_dnssec(domain: str) -> Dict[str, Any]:
 
 def check_open_resolver(domain: str) -> Dict[str, Any]:
     """
-    Checks if the domain's nameservers are configured as open resolvers.
+    Checks if the domain's nameservers are configured as open resolvers
+    using the test.openresolver.com test domain.
     
     Args:
         domain (str): The domain to check
@@ -290,92 +283,129 @@ def check_open_resolver(domain: str) -> Dict[str, Any]:
         "ns_checked": [],
         "open_resolvers": [],
         "errors": [],
-        "warnings": []
+        "warnings": [],
+        "recommendations": []
     }
     
     try:
-        # Get nameservers
+        # Get nameservers for the domain
         try:
             ns_records = dns.resolver.resolve(domain, 'NS')
         except Exception as e:
             results["errors"].append(f"Could not resolve nameservers: {str(e)}")
             return results
         
+        # Test each nameserver using test.openresolver.com
+        test_domain = "test.openresolver.com"
+        
         for ns in ns_records:
             ns_name = str(ns).rstrip('.')
-            ns_ips = get_nameserver_ips(ns_name)
             
-            if not ns_ips:
-                results["errors"].append(f"Could not resolve IP for nameserver {ns_name}")
+            # Get IPv4 addresses for the nameserver
+            try:
+                a_records = dns.resolver.resolve(ns_name, 'A')
+                ipv4_addresses = [str(rdata) for rdata in a_records]
+            except Exception as e:
+                results["errors"].append(f"Could not resolve IPv4 address for nameserver {ns_name}: {str(e)}")
+                ipv4_addresses = []
+            
+            if not ipv4_addresses:
+                results["errors"].append(f"No IPv4 addresses found for nameserver {ns_name}")
                 continue
                 
-            for ip in ns_ips:
-                # Create a test query for a domain unrelated to the one being tested
-                test_query = dns.message.make_query("example.com", dns.rdatatype.A, dns.rdataclass.IN)
-                test_query.flags |= dns.flags.RD  # Set Recursion Desired flag
-                
+            for ip in ipv4_addresses:
                 ns_result = {
                     "nameserver": ns_name,
                     "ip": ip,
                     "is_open": False,
+                    "response": None,
                     "error": None
                 }
                 
+                # Create a custom resolver using this nameserver
+                custom_resolver = dns.resolver.Resolver()
+                custom_resolver.nameservers = [ip]
+                custom_resolver.timeout = 3.0  # Short timeout
+                custom_resolver.lifetime = 3.0
+                
                 try:
-                    # Try to send query to the nameserver with a short timeout
-                    response = dns.query.udp(test_query, ip, timeout=3)
+                    # Query test.openresolver.com TXT record
+                    # If the nameserver responds with a valid answer, it's an open resolver
+                    txt_answers = custom_resolver.resolve(test_domain, 'TXT')
                     
-                    # More accurate check for open resolvers:
-                    # 1. Check for successful answer to the query
-                    has_answer = response and response.answer and len(response.answer) > 0
-                    
-                    # 2. Check for recursion available flag
-                    recursion_available = response and (response.flags & dns.flags.RA)
-                    
-                    # Properly configured authoritative nameservers should:
-                    # - Not answer recursive queries for unrelated domains
-                    # - Not have the RA flag set
-                    
-                    if has_answer:
-                        # Actually provided an answer to our query - definitely open
-                        ns_result["is_open"] = True
-                        results["open_resolvers"].append(ns_result)
-                        results["warnings"].append(f"Nameserver {ns_name} ({ip}) is an open resolver - answered query for unrelated domain")
-                    elif recursion_available:
-                        # RA flag is set - this is often a sign, but not definitive
-                        # Check if it actually provided usable information or just a referral
-                        if len(response.authority) > 0 and not response.answer:
-                            # This is likely just a proper referral response, not an open resolver
-                            ns_result["is_open"] = False
-                        else:
-                            # Set recursion available but didn't give a proper referral - likely open
-                            ns_result["is_open"] = True
-                            results["open_resolvers"].append(ns_result)
-                            results["warnings"].append(f"Nameserver {ns_name} ({ip}) may be an open resolver - has recursion available flag")
-                    else:
-                        # Responded but didn't answer query and no RA flag - good
-                        ns_result["is_open"] = False
+                    # Parse the response
+                    if txt_answers:
+                        txt_records = []
+                        for rdata in txt_answers:
+                            for txt_string in rdata.strings:
+                                txt_records.append(txt_string.decode('utf-8'))
                         
+                        # If we got TXT records, this is definitely an open resolver
+                        ns_result["is_open"] = True
+                        ns_result["response"] = txt_records
+                        results["open_resolvers"].append(ns_result)
+                        
+                        # Add a warning
+                        results["warnings"].append(
+                            f"Nameserver {ns_name} ({ip}) is an open resolver - "
+                            f"successfully resolved test.openresolver.com"
+                        )
+                    
+                except dns.resolver.NXDOMAIN:
+                    # NXDOMAIN response means the nameserver tried to resolve it
+                    # but didn't find the domain - still an open resolver
+                    ns_result["is_open"] = True
+                    ns_result["response"] = "NXDOMAIN"
+                    results["open_resolvers"].append(ns_result)
+                    results["warnings"].append(
+                        f"Nameserver {ns_name} ({ip}) may be an open resolver - "
+                        f"returned NXDOMAIN for test.openresolver.com"
+                    )
+                    
+                except dns.resolver.NoAnswer:
+                    # No answer could mean various things - we'll consider it not open
+                    ns_result["response"] = "NO_ANSWER"
+                    
+                except dns.resolver.NoNameservers:
+                    # The nameserver refused to perform recursive resolution - good!
+                    ns_result["response"] = "REFUSED"
+                    
+                except dns.exception.Timeout:
+                    # Timeout typically means the nameserver is not open for recursion - good!
+                    ns_result["response"] = "TIMEOUT"
+                    ns_result["error"] = "Query timed out"
+                    
                 except Exception as e:
-                    # This is actually good - the nameserver refused our query
+                    # Other errors - likely means not an open resolver
                     ns_result["error"] = str(e)
-                    ns_result["is_open"] = False
+                    
+                    # Check specific error messages
+                    error_str = str(e).lower()
+                    if "refused" in error_str:
+                        ns_result["response"] = "REFUSED"
+                    elif "timeout" in error_str:
+                        ns_result["response"] = "TIMEOUT"
+                    else:
+                        ns_result["response"] = "ERROR"
                 
+                # Add result to checked list
                 results["ns_checked"].append(ns_result)
-                
-        # Add clear warning and recommendation if open resolvers found
+        
+        # Add recommendations if open resolvers found
         if results["open_resolvers"]:
             results["warnings"].append(
-                "Open DNS resolvers can be abused for DNS amplification attacks"
+                "Open DNS resolvers can be abused for DNS amplification attacks and should be disabled"
             )
             results["recommendations"] = [
                 "Configure your nameservers to only provide recursive service to authorized clients",
-                "Check your DNS server configuration to disable recursive queries from external sources"
+                "Add ACLs (Access Control Lists) to your DNS server configuration",
+                "For BIND: add 'allow-recursion { localnets; };' to your named.conf",
+                "For other DNS servers: consult documentation on restricting recursive queries"
             ]
-                
+        
     except Exception as e:
         results["errors"].append(f"Error checking open resolvers: {str(e)}")
-        
+    
     return results
 
 def check_nameserver_diversity(domain: str) -> Dict[str, Any]:
