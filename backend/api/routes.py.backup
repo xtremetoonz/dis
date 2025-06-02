@@ -44,6 +44,10 @@ def get_domain_param():
     return domain
 
 @api_bp.route('/dns', methods=['GET'])
+@api_security.require_api_key
+def protected_resource():
+    # Only accessible with valid API key
+    return {"status": "success"}
 def dns_endpoint():
     """Get DNS records for a domain"""
     domain = get_domain_param()
@@ -65,6 +69,10 @@ def dns_endpoint():
         }), 500
 
 @api_bp.route('/mx', methods=['GET'])
+@api_security.require_api_key
+def protected_resource():
+    # Only accessible with valid API key
+    return {"status": "success"}
 def mx_endpoint():
     """Get MX records for a domain"""
     domain = get_domain_param()
@@ -86,6 +94,10 @@ def mx_endpoint():
         }), 500
 
 @api_bp.route('/spf', methods=['GET'])
+@api_security.require_api_key
+def protected_resource():
+    # Only accessible with valid API key
+    return {"status": "success"}
 def spf_endpoint():
     """Get SPF record for a domain with enhanced analysis"""
     domain = get_domain_param()
@@ -129,6 +141,10 @@ def spf_endpoint():
         }), 500
 
 @api_bp.route('/dkim', methods=['GET'])
+@api_security.require_api_key
+def protected_resource():
+    # Only accessible with valid API key
+    return {"status": "success"}
 def dkim_endpoint():
     """Check DKIM selectors for a domain"""
     domain = get_domain_param()
@@ -155,6 +171,10 @@ def dkim_endpoint():
         }), 500
 
 @api_bp.route('/dmarc', methods=['GET'])
+@api_security.require_api_key
+def protected_resource():
+    # Only accessible with valid API key
+    return {"status": "success"}
 def dmarc_endpoint():
     """Get DMARC policy for a domain"""
     domain = get_domain_param()
@@ -176,6 +196,10 @@ def dmarc_endpoint():
         }), 500
 
 @api_bp.route('/ssl', methods=['GET'])
+@api_security.require_api_key
+def protected_resource():
+    # Only accessible with valid API key
+    return {"status": "success"}
 def ssl_endpoint():
     """Get SSL/TLS information for a domain"""
     domain = get_domain_param()
@@ -197,6 +221,10 @@ def ssl_endpoint():
         }), 500
 
 @api_bp.route('/whois', methods=['GET'])
+@api_security.require_api_key
+def protected_resource():
+    # Only accessible with valid API key
+    return {"status": "success"}
 def whois_endpoint():
     """Get WHOIS information for a domain"""
     domain = get_domain_param()
@@ -218,6 +246,10 @@ def whois_endpoint():
         }), 500
 
 @api_bp.route('/bimi', methods=['GET'])
+@api_security.require_api_key
+def protected_resource():
+    # Only accessible with valid API key
+    return {"status": "success"}
 def bimi_endpoint():
     """Check BIMI configuration for a domain"""
     domain = get_domain_param()
@@ -239,6 +271,10 @@ def bimi_endpoint():
         }), 500
 
 @api_bp.route('/scan', methods=['GET'])
+@api_security.require_api_key
+def protected_resource():
+    # Only accessible with valid API key
+    return {"status": "success"}
 def scan_all_endpoint():
     """
     Run all checks for a domain in one request
@@ -326,6 +362,10 @@ def scan_all_endpoint():
         }), 500
 
 @api_bp.route('/all', methods=['GET'])
+@api_security.require_api_key
+def protected_resource():
+    # Only accessible with valid API key
+    return {"status": "success"}
 def all_checks_endpoint():
     """
     Alias for scan_all_endpoint
