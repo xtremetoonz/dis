@@ -2,7 +2,6 @@ from dotenv import load_dotenv
 import os
 from flask import Flask, Blueprint, jsonify, request
 from flask_cors import CORS
-import sys
 import logging
 from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime
@@ -11,17 +10,14 @@ import uuid
 # Load environment variables from .env file
 load_dotenv()
 
-# Import utility modules - adjust these imports to match your project structure
-# Use relative imports or absolute imports based on your project layout
+# Import utility modules
 try:
-    # Try your existing error handling module first
     from errors import register_error_handlers, APIError
 except ImportError:
-    # Fallback - your existing errors module might be at a different path
     try:
         from backend.modules.errors import register_error_handlers, APIError
     except ImportError:
-        # If we can't find it, use a simple version
+        # Fallback error handling
         from werkzeug.exceptions import HTTPException
         
         class APIError(Exception):
@@ -73,16 +69,45 @@ except ImportError:
                     'message': 'An unexpected error occurred'
                 }), 500
 
-# Import API security components - create these files in your project structure
+# Import API security components
 from api_security import ApiSecurity
 
-# Create the security module
+# Global security instance
 api_security = None
 
-def get_api_security():
-    """Get the initialized API security instance"""
-    global api_security
-    return api_security
+def load_api_keys_from_file(file_path):
+    """Load API keys from a dedicated file"""
+    api_keys = {}
+
+    if not os.path.exists(file_path):
+        return api_keys
+
+    try:
+        with open(file_path, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+
+                # Parse CLIENT_NAME=key:client_id:client_name:secret_key
+                if '=' in line:
+                    client_name, key_data = line.split('=', 1)
+                    parts = key_data.split(':')
+
+                    if len(parts) >= 4:
+                        key, client_id, name, secret_key = parts[:4]
+                        api_keys[key] = {
+                            'id': client_id,
+                            'name': name,
+                            'secret_key': secret_key
+                        }
+                    else:
+                        print(f"Warning: Invalid key format on line {line_num}")
+    except Exception as e:
+        print(f"Error loading API keys from file: {e}")
+
+    return api_keys
 
 def init_security(app):
     """
@@ -95,6 +120,15 @@ def init_security(app):
     
     # Load API keys from environment or config
     api_keys = {}
+
+        # Method 1: Load from dedicated keys file
+    keys_file = os.environ.get('API_KEYS_FILE', '/srv/git/dis/api_keys.conf')
+    file_keys = load_api_keys_from_file(keys_file)
+    api_keys.update(file_keys)
+
+    for key, info in file_keys.items():
+        app.logger.info(f"✅ Loaded API key for {info['name']} from keys file")
+
     
     # Method 1: Load from environment variables
     # Format: API_KEY_NAME=key:client_id:client_name:secret_key
@@ -117,20 +151,10 @@ def init_security(app):
     config_keys = app.config.get('API_KEYS', {})
     api_keys.update(config_keys)
     
-    # If no keys defined, create a development key if in debug mode
-    if not api_keys and app.debug:
-        app.logger.warning("No API keys defined. Creating a development key.")
-        dev_credentials = api_security.generate_client_credentials("development")
-        api_keys[dev_credentials["api_key"]] = {
-            'id': dev_credentials["client_id"],
-            'name': dev_credentials["client_name"],
-            'secret_key': dev_credentials["secret_key"]
-        }
-        app.logger.info(f"Development API Key: {dev_credentials['api_key']}")
-    
     # Store the keys in config
     app.config['API_KEYS'] = api_keys
     
+    # Initialize security instance
     if api_security is None:
         api_security = ApiSecurity()
     api_security.init_app(app)
@@ -138,12 +162,10 @@ def init_security(app):
     # Log the number of loaded keys
     app.logger.info(f"Loaded {len(api_keys)} API keys")
     
-    # Debug: Show what keys are actually stored
+    # Log available keys (for debugging)
     for key, info in api_keys.items():
         app.logger.info(f"Available API key: {key[:8]}... -> {info['name']}")
 
-# Simplified limiter implementation
-limiter = None
 def configure_limiter(app):
     """
     Configure rate limiting for the application
@@ -152,11 +174,9 @@ def configure_limiter(app):
         app: Flask application instance
     """
     try:
-        # Try to import flask-limiter
         from flask_limiter import Limiter
         from flask_limiter.util import get_remote_address
         
-        # Create a new limiter instance
         global limiter
         limiter = Limiter(
             get_remote_address,
@@ -165,10 +185,8 @@ def configure_limiter(app):
             storage_uri="memory://",
         )
         
-        # Log that it was configured successfully
         app.logger.info("Rate limiter configured")
         
-        # Register error handler for rate limit exceeded
         @app.errorhandler(429)
         def ratelimit_handler(e):
             app.logger.warning(f"Rate limit exceeded: {e.description}")
@@ -178,7 +196,6 @@ def configure_limiter(app):
                 "details": e.description
             }, 429
     except ImportError:
-        # Flask-Limiter might not be installed, just log a warning
         app.logger.warning("Flask-Limiter not installed, rate limiting disabled")
 
 def configure_logging(app):
@@ -191,21 +208,17 @@ def configure_logging(app):
     Returns:
         Logger instance
     """
-    # Get log level from config or env
     log_level_name = app.config.get('LOG_LEVEL', 'INFO')
     log_level = getattr(logging, log_level_name.upper(), logging.INFO)
     
-    # Configure root logger
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
     )
     
-    # Configure Flask logger
     app.logger.setLevel(log_level)
     
-    # Ensure all Flask's loggers are properly set
     for logger in [
         logging.getLogger('werkzeug'),
         logging.getLogger('flask'),
@@ -214,17 +227,36 @@ def configure_logging(app):
         
     return app.logger
 
-# Import your routes
-# Adapt this import to match your existing routes
-try:
-    from backend.api.routes import api_bp
-except ImportError as e:
-    # Create a minimal blueprint if your routes are elsewhere
-    api_bp = Blueprint('api', __name__, url_prefix='/api/v1')
+# ============================================================================
+# ROUTES IMPORT SECTION
+# ============================================================================
+# TEMPORARY DEBUG: This section has extra debugging that can be removed once 
+# the import issue is resolved. The debug prints can be commented out later.
 
+try:
+    print("🔍 DEBUG: Attempting to import routes...")  # TEMP: Remove this line later
+    from backend.api.routes import api_bp
+    print("✅ DEBUG: Successfully imported routes from backend.api.routes")  # TEMP: Remove this line later
+    print(f"🔍 DEBUG: Blueprint: {api_bp}")  # TEMP: Remove this line later
+    print(f"🔍 DEBUG: Blueprint URL prefix: {api_bp.url_prefix}")  # TEMP: Remove this line later
+    
+    # TEMP DEBUG: Check blueprint functions - Remove this block later
+    if hasattr(api_bp, 'deferred_functions'):
+        route_count = len(list(api_bp.deferred_functions))
+        print(f"🔍 DEBUG: Number of routes in blueprint: {route_count}")  # TEMP: Remove this line later
+    
+except ImportError as e:
+    print(f"❌ DEBUG: Routes import failed: {e}")  # TEMP: Remove this line later
+    print(f"❌ DEBUG: Error details: {str(e)}")  # TEMP: Remove this line later
+    
+    # Fallback minimal blueprint
+    api_bp = Blueprint('api', __name__, url_prefix='/api/v1')
+    
     @api_bp.route('/health')
     def api_health():
         return jsonify({"status": "ok"})
+
+# ============================================================================
 
 def create_app(config=None):
     """
@@ -242,7 +274,7 @@ def create_app(config=None):
     # Fix for running behind proxy
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
     
-    # Basic configuration - adjust for your project structure
+    # Basic configuration
     app.config.update({
         'SECRET_KEY': os.environ.get('SECRET_KEY', 'dev-key'),
         'LOG_LEVEL': os.environ.get('LOG_LEVEL', 'INFO'),
@@ -256,7 +288,7 @@ def create_app(config=None):
         from config import Config
         app.config.from_object(Config)
     except ImportError:
-        app.logger.warning("Config module not found, using default configuration")
+        pass  # No config module, use defaults
     
     # Apply any provided configuration override
     if config:
@@ -284,9 +316,8 @@ def create_app(config=None):
     # Register blueprints
     app.register_blueprint(api_bp)
     
-    # Add health check endpoint
+    # Add health check endpoint (NO AUTHENTICATION REQUIRED)
     @app.route('/health')
-    @api_security.require_api_key
     def health_check():
         return jsonify({
             "status": "ok",
@@ -295,16 +326,34 @@ def create_app(config=None):
             "environment": app.config.get('ENV', 'production')
         })
     
-    # Add API key info endpoint (protected)
+    # Add API key verification endpoint (AUTHENTICATION REQUIRED)
     @app.route('/api/v1/auth/verify', methods=['GET'])
-    @api_security.require_api_key
     def verify_auth():
+        # Import at runtime to avoid circular imports
+        from flask import current_app
+        
+        # Get API key from header
+        api_key = request.headers.get('X-API-Key')
+        
+        # Get API keys from Flask config
+        api_keys = current_app.config.get('API_KEYS', {})
+        
+        # Check if API key is provided and valid
+        if not api_key or api_key not in api_keys:
+            return jsonify({
+                "status": "error",
+                "message": "Unauthorized - Valid API key required"
+            }), 401
+        
+        # Get client info
+        client_info = api_keys[api_key]
+        
         return jsonify({
             "status": "success",
             "authenticated": True,
-            "client_id": request.client_id,
-            "client_name": request.client_name,
-            "message": f"Authentication successful for {request.client_name}"
+            "client_id": client_info.get('id'),
+            "client_name": client_info.get('name'),
+            "message": f"Authentication successful for {client_info.get('name')}"
         })
     
     # Add startup log entry
@@ -316,7 +365,15 @@ def create_app(config=None):
 if __name__ == '__main__':
     # Create the application
     app = create_app()
-   
+  
+    # ========================================================================
+    # TEMPORARY DEBUG SECTION - Remove this entire block once routes are working
+    print("\n=== DEBUG: REGISTERED ROUTES ===")
+    for rule in app.url_map.iter_rules():
+        print(f"{rule.methods} {rule.rule}")
+    print("=================================\n")
+    # ========================================================================
+
     # Get port from environment or use default
     port = int(os.environ.get('PORT', 5000))
     
