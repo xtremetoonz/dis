@@ -5,6 +5,7 @@ import dns.name
 import dns.message
 import dns.rdatatype
 import dns.flags
+import dns.dnssec
 import socket
 import ipaddress
 from dns.exception import DNSException
