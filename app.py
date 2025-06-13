@@ -230,32 +230,16 @@ def configure_logging(app):
 # ============================================================================
 # ROUTES IMPORT SECTION
 # ============================================================================
-# TEMPORARY DEBUG: This section has extra debugging that can be removed once 
-# the import issue is resolved. The debug prints can be commented out later.
-
 try:
-    print("🔍 DEBUG: Attempting to import routes...")  # TEMP: Remove this line later
     from backend.api.routes import api_bp
-    print("✅ DEBUG: Successfully imported routes from backend.api.routes")  # TEMP: Remove this line later
-    print(f"🔍 DEBUG: Blueprint: {api_bp}")  # TEMP: Remove this line later
-    print(f"🔍 DEBUG: Blueprint URL prefix: {api_bp.url_prefix}")  # TEMP: Remove this line later
-    
-    # TEMP DEBUG: Check blueprint functions - Remove this block later
-    if hasattr(api_bp, 'deferred_functions'):
-        route_count = len(list(api_bp.deferred_functions))
-        print(f"🔍 DEBUG: Number of routes in blueprint: {route_count}")  # TEMP: Remove this line later
-    
 except ImportError as e:
-    print(f"❌ DEBUG: Routes import failed: {e}")  # TEMP: Remove this line later
-    print(f"❌ DEBUG: Error details: {str(e)}")  # TEMP: Remove this line later
-    
-    # Fallback minimal blueprint
+    # Fallback blueprint if routes import fails
+    app.logger.error(f"Failed to import routes: {e}")
     api_bp = Blueprint('api', __name__, url_prefix='/api/v1')
     
     @api_bp.route('/health')
     def api_health():
         return jsonify({"status": "ok"})
-
 # ============================================================================
 
 def create_app(config=None):
