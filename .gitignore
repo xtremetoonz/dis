@@ -40,3 +40,7 @@ ehthumbs.db
 Thumbs.db
 api_keys.conf
 *.key
+api_keys.conf
+*.key
+.env.local
+*.backup
