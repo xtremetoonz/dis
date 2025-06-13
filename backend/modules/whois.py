@@ -7,6 +7,7 @@ import logging
 import json
 import socket
 import ipaddress
+import shutil
 
 # Configure module logger
 logger = logging.getLogger(__name__)
@@ -525,6 +526,7 @@ def get_whois_info(domain: str) -> Dict[str, Any]:
     Returns:
         Dict: Dictionary containing WHOIS information and analysis
     """
+
     results = {
         "raw_data": None,
         "parsed": {},
@@ -550,8 +552,10 @@ def get_whois_info(domain: str) -> Dict[str, Any]:
             results["debug_info"]["which_error"] = which_process.stderr
             return results
             
-        whois_path = which_process.stdout.strip()
+        whois_path = shutil.which('whois')
         results["debug_info"]["whois_path"] = whois_path
+        if not whois_path:
+            raise FileNotFoundError("whois command not found")
         
         # Try running whois with full path
         process = subprocess.run(

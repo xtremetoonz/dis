@@ -1,10 +1,15 @@
+from dotenv import load_dotenv
+import os
 from flask import Flask, Blueprint, jsonify, request
 from flask_cors import CORS
-import os
+import sys
 import logging
 from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime
 import uuid
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Import utility modules - adjust these imports to match your project structure
 # Use relative imports or absolute imports based on your project layout
@@ -72,7 +77,12 @@ except ImportError:
 from api_security import ApiSecurity
 
 # Create the security module
-api_security = ApiSecurity()
+api_security = None
+
+def get_api_security():
+    """Get the initialized API security instance"""
+    global api_security
+    return api_security
 
 def init_security(app):
     """
@@ -81,6 +91,8 @@ def init_security(app):
     Args:
         app: Flask application instance
     """
+    global api_security
+    
     # Load API keys from environment or config
     api_keys = {}
     
@@ -97,6 +109,7 @@ def init_security(app):
                         'name': client_name,
                         'secret_key': secret_key
                     }
+                    app.logger.info(f"✅ Loaded API key for {client_name}")
             except Exception as e:
                 app.logger.error(f"Error parsing API key from environment: {e}")
     
@@ -114,16 +127,20 @@ def init_security(app):
             'secret_key': dev_credentials["secret_key"]
         }
         app.logger.info(f"Development API Key: {dev_credentials['api_key']}")
-        app.logger.info(f"Development Secret Key: {dev_credentials['secret_key']}")
     
     # Store the keys in config
     app.config['API_KEYS'] = api_keys
     
-    # Initialize security with the app
+    if api_security is None:
+        api_security = ApiSecurity()
     api_security.init_app(app)
-    
+
     # Log the number of loaded keys
     app.logger.info(f"Loaded {len(api_keys)} API keys")
+    
+    # Debug: Show what keys are actually stored
+    for key, info in api_keys.items():
+        app.logger.info(f"Available API key: {key[:8]}... -> {info['name']}")
 
 # Simplified limiter implementation
 limiter = None
@@ -201,10 +218,10 @@ def configure_logging(app):
 # Adapt this import to match your existing routes
 try:
     from backend.api.routes import api_bp
-except ImportError:
+except ImportError as e:
     # Create a minimal blueprint if your routes are elsewhere
     api_bp = Blueprint('api', __name__, url_prefix='/api/v1')
-    
+
     @api_bp.route('/health')
     def api_health():
         return jsonify({"status": "ok"})
@@ -269,6 +286,7 @@ def create_app(config=None):
     
     # Add health check endpoint
     @app.route('/health')
+    @api_security.require_api_key
     def health_check():
         return jsonify({
             "status": "ok",
@@ -298,9 +316,12 @@ def create_app(config=None):
 if __name__ == '__main__':
     # Create the application
     app = create_app()
-    
+   
     # Get port from environment or use default
     port = int(os.environ.get('PORT', 5000))
     
     # Run the application
     app.run(host='0.0.0.0', port=port, debug=app.config.get('DEBUG', False))
+
+# Add this for Gunicorn - create app at module level
+app = create_app()

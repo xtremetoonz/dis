@@ -1,0 +1,375 @@
+from flask import Blueprint, jsonify, request, current_app
+from flask_cors import CORS
+import re
+import logging
+from datetime import datetime
+import uuid
+from werkzeug.exceptions import BadRequest
+
+# Import module functions 
+from backend.modules.dns import get_dns_records
+from backend.modules.mx import get_mx_records
+from backend.modules.spf import get_spf_record, analyze_spf_policy
+from backend.modules.dkim import check_dkim_selectors
+from backend.modules.dmarc import get_dmarc_policy
+from backend.modules.ssl import get_ssl_info
+from backend.modules.whois import get_whois_info
+from backend.modules.bimi import check_bimi
+
+def require_auth(f):
+    """Helper function to apply authentication"""
+    def wrapper(*args, **kwargs):
+        # Get api_security from the Flask app context
+        from app import api_security
+        # Apply the authentication check
+        return api_security.require_api_key(f)(*args, **kwargs)
+    return wrapper
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Create blueprint for API routes
+api_bp = Blueprint('api', __name__, url_prefix='/api/v1')
+
+# Domain validation regex pattern
+DOMAIN_PATTERN = re.compile(
+    r'^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$',
+    re.IGNORECASE
+)
+
+def validate_domain(domain):
+    """Validates domain format"""
+    if not domain or not isinstance(domain, str):
+        return False
+    return bool(DOMAIN_PATTERN.match(domain))
+
+def get_domain_param():
+    """Extract and validate domain from request"""
+    domain = request.args.get('domain')
+    if not domain:
+        raise BadRequest("Missing domain parameter")
+    if not validate_domain(domain):
+        raise BadRequest("Invalid domain format")
+    return domain
+
+@api_bp.route('/dns', methods=['GET'])
+@require_auth
+def dns_endpoint():
+    """Get DNS records for a domain"""
+    domain = get_domain_param()
+    logger.info(f"DNS check requested for domain: {domain}")
+    
+    try:
+        results = get_dns_records(domain)
+        return jsonify({
+            "status": "success",
+            "domain": domain,
+            "data": results
+        })
+    except Exception as e:
+        logger.error(f"Error in DNS check for {domain}: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "domain": domain,
+            "message": "Failed to retrieve DNS records"
+        }), 500
+
+@api_bp.route('/mx', methods=['GET'])
+@require_auth
+def mx_endpoint():
+    """Get MX records for a domain"""
+    domain = get_domain_param()
+    logger.info(f"MX check requested for domain: {domain}")
+
+    try:
+        results = get_mx_records(domain)
+        return jsonify({
+            "status": "success",
+            "domain": domain,
+            "data": results
+        })
+    except Exception as e:
+        logger.error(f"Error in MX check for {domain}: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "domain": domain,
+            "message": "Failed to retrieve MX records"
+        }), 500
+
+@api_bp.route('/spf', methods=['GET'])
+@require_auth
+def spf_endpoint():
+    """Get SPF record for a domain with enhanced analysis"""
+    domain = get_domain_param()
+    logger.info(f"SPF check requested for domain: {domain}")
+
+    try:
+        # Get basic SPF record data
+        results = get_spf_record(domain)
+
+        # Add enhanced analysis
+        if results["record"]:
+            analysis = analyze_spf_policy(results)
+            results["analysis"] = analysis
+
+            # Add a clear explanation about lookup counting
+            lookup_count = results.get("lookup_count", {})
+            total_lookups = lookup_count.get("total", 0)
+
+            results["lookup_summary"] = {
+                "explanation": "SPF has a limit of 10 DNS lookups per evaluation",
+                "total_lookups_used": total_lookups,
+                "remaining_lookups": max(0, 10 - total_lookups),
+                "status": (
+                    "critical - exceeds limit" if total_lookups > 10 else
+                    "warning - approaching limit" if total_lookups > 8 else
+                    "good - within limit"
+                )
+            }
+
+        return jsonify({
+            "status": "success",
+            "domain": domain,
+            "data": results
+        })
+    except Exception as e:
+        logger.error(f"Error in SPF check for {domain}: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "domain": domain,
+            "message": "Failed to retrieve SPF record"
+        }), 500
+
+@api_bp.route('/dkim', methods=['GET'])
+@require_auth
+def dkim_endpoint():
+    """Check DKIM selectors for a domain"""
+    domain = get_domain_param()
+
+    # Optional parameter for specific selectors
+    selectors = request.args.get('selectors')
+    selector_list = selectors.split(',') if selectors else None
+
+    logger.info(f"DKIM check requested for domain: {domain}, selectors: {selector_list}")
+
+    try:
+        results = check_dkim_selectors(domain, selector_list)
+        return jsonify({
+            "status": "success",
+            "domain": domain,
+            "data": results
+        })
+    except Exception as e:
+        logger.error(f"Error in DKIM check for {domain}: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "domain": domain,
+            "message": "Failed to check DKIM selectors"
+        }), 500
+
+@api_bp.route('/dmarc', methods=['GET'])
+@require_auth
+def dmarc_endpoint():
+    """Get DMARC policy for a domain"""
+    domain = get_domain_param()
+    logger.info(f"DMARC check requested for domain: {domain}")
+
+    try:
+        results = get_dmarc_policy(domain)
+        return jsonify({
+            "status": "success",
+            "domain": domain,
+            "data": results
+        })
+    except Exception as e:
+        logger.error(f"Error in DMARC check for {domain}: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "domain": domain,
+            "message": "Failed to retrieve DMARC policy"
+        }), 500
+
+@api_bp.route('/ssl', methods=['GET'])
+@require_auth
+def ssl_endpoint():
+    """Get SSL/TLS information for a domain"""
+    domain = get_domain_param()
+    logger.info(f"SSL check requested for domain: {domain}")
+
+    try:
+        results = get_ssl_info(domain)
+        return jsonify({
+            "status": "success",
+            "domain": domain,
+            "data": results
+        })
+    except Exception as e:
+        logger.error(f"Error in SSL check for {domain}: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "domain": domain,
+            "message": "Failed to retrieve SSL information"
+        }), 500
+
+@api_bp.route('/whois', methods=['GET'])
+@require_auth
+def whois_endpoint():
+    """Get WHOIS information for a domain"""
+    domain = get_domain_param()
+    logger.info(f"WHOIS check requested for domain: {domain}")
+
+    try:
+        results = get_whois_info(domain)
+        return jsonify({
+            "status": "success",
+            "domain": domain,
+            "data": results
+        })
+    except Exception as e:
+        logger.error(f"Error in WHOIS check for {domain}: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "domain": domain,
+            "message": "Failed to retrieve WHOIS information"
+        }), 500
+
+@api_bp.route('/bimi', methods=['GET'])
+@require_auth
+def bimi_endpoint():
+    """Check BIMI configuration for a domain"""
+    domain = get_domain_param()
+    logger.info(f"BIMI check requested for domain: {domain}")
+
+    try:
+        results = check_bimi(domain)
+        return jsonify({
+            "status": "success",
+            "domain": domain,
+            "data": results
+        })
+    except Exception as e:
+        logger.error(f"Error in BIMI check for {domain}: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "domain": domain,
+            "message": "Failed to check BIMI configuration"
+        }), 500
+
+@api_bp.route('/scan', methods=['GET'])
+@require_auth
+def scan_all_endpoint():
+    """
+    Run all checks for a domain in one request
+    """
+    try:
+        domain = get_domain_param()
+        logger.info(f"Full scan requested for domain: {domain}")
+
+        results = {
+            "domain": domain,
+            "timestamp": datetime.utcnow().isoformat(),
+            "scan_id": str(uuid.uuid4()),
+            "checks": {},
+            "errors": []
+        }
+
+        # List of all checks to run
+        checks = [
+            {"name": "dns", "function": get_dns_records, "complete": False},
+            {"name": "mx", "function": get_mx_records, "complete": False},
+            {"name": "spf", "function": get_spf_record, "complete": False},
+            {"name": "dkim", "function": check_dkim_selectors, "complete": False},
+            {"name": "dmarc", "function": get_dmarc_policy, "complete": False},
+            {"name": "ssl", "function": get_ssl_info, "complete": False},
+            {"name": "whois", "function": get_whois_info, "complete": False},
+            {"name": "bimi", "function": check_bimi, "complete": False}
+        ]
+
+        # Run each check
+        for check in checks:
+            check_name = check["name"]
+            check_function = check["function"]
+
+            try:
+                logger.info(f"Running {check_name} check for {domain}")
+                check_result = check_function(domain)
+                results["checks"][check_name] = check_result
+                check["complete"] = True
+                logger.info(f"Completed {check_name} check for {domain}")
+            except Exception as e:
+                error_msg = f"Error in {check_name} check: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                results["errors"].append(error_msg)
+                # Add a placeholder for the failed check
+                results["checks"][check_name] = {
+                    "error": f"Check failed: {str(e)}",
+                    "complete": False
+                }
+
+        # Add summary information
+        complete_checks = sum(1 for check in checks if check["complete"])
+        results["summary"] = {
+            "total_checks": len(checks),
+            "complete_checks": complete_checks,
+            "success_rate": f"{(complete_checks / len(checks)) * 100:.1f}%"
+        }
+
+        # Make sure the response is JSON serializable
+        try:
+            response_data = {
+                "status": "success",
+                "data": results
+            }
+            return jsonify(response_data)
+        except (TypeError, ValueError) as json_error:
+            logger.error(f"JSON serialization error: {str(json_error)}", exc_info=True)
+            # Return a simplified response
+            return jsonify({
+                "status": "partial_success",
+                "message": "Some results could not be serialized to JSON",
+                "domain": domain,
+                "scan_id": results["scan_id"],
+                "summary": {
+                    "total_checks": len(checks),
+                    "complete_checks": complete_checks,
+                    "errors": len(results["errors"]) + 1
+                }
+            })
+
+    except Exception as e:
+        logger.error(f"Error in scan endpoint: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to complete domain scan: {str(e)}"
+        }), 500
+
+@api_bp.route('/all', methods=['GET'])
+@require_auth
+def all_checks_endpoint():
+    """
+    Alias for scan_all_endpoint
+    """
+    try:
+        return scan_all_endpoint()
+    except Exception as e:
+        logger.error(f"Error in all_checks_endpoint: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to complete domain scan: {str(e)}"
+        }), 500
+
+# Error handlers
+@api_bp.errorhandler(BadRequest)
+def handle_bad_request(e):
+    return jsonify({
+        "status": "error",
+        "message": str(e)
+    }), 400
+
+@api_bp.errorhandler(Exception)
+def handle_exception(e):
+    logger.error(f"Unhandled exception: {str(e)}", exc_info=True)
+    return jsonify({
+        "status": "error",
+        "message": "An unexpected error occurred"
+    }), 500

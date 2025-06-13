@@ -10,8 +10,17 @@ import hmac
 import hashlib
 import uuid
 
-# Configure module logger
+# Configure module logger - FORCE it to show
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Add a console handler to make sure we see output
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 class ApiSecurity:
     """
@@ -64,17 +73,23 @@ class ApiSecurity:
         @wraps(f)
         def decorated(*args, **kwargs):
             api_key = request.headers.get('X-API-Key')
-            
+        
+            # DEBUG: Log what we're checking
+            logger.info(f"🔍 Checking API key: {api_key[:8] if api_key else 'None'}...")
+            logger.info(f"🔍 Available keys: {list(self.api_keys.keys())}")
+            logger.info(f"🔍 Number of keys in memory: {len(self.api_keys)}")
+
             # Check if API key is provided
             if not api_key:
                 logger.warning("API request without API key")
                 abort(401, "API key required")
             
-            # Check if API key is valid
+                   # Check if API key is valid
             if api_key not in self.api_keys:
                 logger.warning(f"Invalid API key: {api_key[:8]}...")
+                logger.warning(f"Available keys: {[k[:8] + '...' for k in self.api_keys.keys()]}")
                 abort(401, "Invalid API key")
-            
+
             # Add client info to request context
             client_info = self.api_keys[api_key]
             request.client_id = client_info.get('id')

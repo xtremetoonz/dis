@@ -1,0 +1,22 @@
+[Unit]
+Description=Domain Intel Scanner API
+After=network.target
+
+[Service]
+[Service]
+Type=simple
+User=dis-service
+Group=dis-service
+WorkingDirectory=/srv/git/dis
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/srv/git/dis/venv/bin
+EnvironmentFile=/srv/git/dis/.env
+ExecStart=/srv/git/dis/venv/bin/gunicorn -c gunicorn.conf.py app:app
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=5
+PrivateTmp=true
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
