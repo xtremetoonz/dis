@@ -38,3 +38,5 @@ coverage.xml
 .Trashes
 ehthumbs.db
 Thumbs.db
+api_keys.conf
+*.key
